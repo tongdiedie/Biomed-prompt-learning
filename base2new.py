@@ -5,7 +5,7 @@ import os
 import shutil
 
 # 定义常量
-DATA = "/home/cao/aredflower/meddatasets"
+DATA = "data"
 MODEL = "BiomedCLIP"
 CFG = "vit_b16_base2new"
 

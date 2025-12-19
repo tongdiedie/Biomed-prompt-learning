@@ -1,7 +1,7 @@
 import os
 from multiprocessing import Pool
 import shutil
-DATA = "/home/cao/aredflower/meddatasets"
+DATA = "data"
 
 CSC = False
 CTP = "end"
@@ -46,13 +46,13 @@ def run_experiment(args):
             shutil.rmtree(ten_path)
 
 if __name__ == "__main__":
-    # datasets = ["btmri", "busi", "chmnist", "covid", "ctkidney", "dermamnist", "kneexray", "kvasir", "lungcolon", "octmnist", "retina"]
+    datasets = ["btmri", "busi", "chmnist", "covid", "ctkidney", "dermamnist", "kneexray", "kvasir", "lungcolon", "octmnist", "retina"]
     shots = [16]
 
     seeds = [1]
-    gpu_ids = [0, 1, 2]  # 假设有 3 块 GPU，可调整
-    # methods = ["BiomedDPT", "BiomedCoOp", "KgCoOp", "CoOp", "CoCoOp", "ProGrad"]
-    methods = ["CoOp", "Maple", "VPT", "DPT"]
+    gpu_ids = [0]  # 假设有 3 块 GPU，可调整
+    methods = ["BiomedDPT", "BiomedCoOp", "KgCoOp", "CoOp", "CoCoOp", "ProGrad"]
+    # methods = ["CoOp", "Maple", "VPT", "DPT"]
     models = ["CLIP"]
     # 生成任务列表，并循环分配 GPU
     tasks = [

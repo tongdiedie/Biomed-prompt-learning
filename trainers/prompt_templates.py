@@ -1,5 +1,23 @@
 # source: https://github.com/openai/CLIP/blob/main/notebooks/Prompt_Engineering_for_ImageNet.ipynb
 
+# 低质量模板：近似零提示（类别名或空字符串）
+ZERO_SHOT_TEMPLATES = {
+    # 最简形式：仅类别名
+    "minimal": "{class}",
+    
+    # 加冠词
+    "article": "a {class}",
+    
+    # 通用描述（非领域化）
+    "generic": "a photo of {class}",
+    
+    # 极简医学术语（无模态信息）
+    "medical_minimal": "a medical image of {class}",
+    
+    # 空字符串（极端情况）
+    "empty": "",
+}
+
 CUSTOM_TEMPLATES = {
     "BUSI": "a photo of a {}.",
     "CTKidney": "a photo of a {}.",

@@ -168,8 +168,11 @@ cython_debug/
 .clip/
 clip/
 .output/
+output/
 
 .idea/
+idea/
+
 .vscode/
 *.sw*
 
