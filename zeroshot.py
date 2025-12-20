@@ -3,7 +3,7 @@ import multiprocessing
 import subprocess
 import shutil
 CFG = "vit_b16"
-DATA = "/home/cao/aredflower/meddatasets"
+DATA = "data"
 MODEL = "BiomedCLIP"
 METHOD = "Zeroshot"
 

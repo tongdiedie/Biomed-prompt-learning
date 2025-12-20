@@ -142,7 +142,7 @@ class PromptLearner(nn.Module):
             nn.init.normal_(ctx_vectors, std=0.02)
             prompt_prefix = " ".join(["X"] * n_ctx)
         
-        print(f'🎯 可学习 Prompt 初始化: "{prompt_prefix}"')
+        print(f'[INIT] Learnable Prompt: \"{prompt_prefix}\"')
         print(f"上下文长度: {n_ctx}")
         self.ctx = nn.Parameter(ctx_vectors)
 
@@ -156,7 +156,7 @@ class PromptLearner(nn.Module):
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
         
         # ========== 2. 加载高质量 Prompt（教师，冻结）==========
-        print("🔼 加载高质量 Prompt（GPT-4 生成，冻结）")
+        print("[TEACHER] Loading high-quality Prompt (GPT-4 generated, frozen)")
         clip_model_temp = load_pubmedclip_to_cpu().float().cuda()
         
         with torch.no_grad():
@@ -173,14 +173,14 @@ class PromptLearner(nn.Module):
                 all_teacher_features.append(text_features.unsqueeze(1))
 
         self.fixed_embeddings = torch.cat(all_teacher_features, dim=1)  # 高质量特征
-        print(f"✅ 高质量 Prompt 数量: {cfg.TRAINER.BIOMEDDPT_ROBUST.N_PROMPTS} 条/类")
+        print(f"[OK] High-quality Prompts: {cfg.TRAINER.BIOMEDDPT_ROBUST.N_PROMPTS} per class")
         
         # ========== 3. 【关键新增】初始化低质量 Prompt（鲁棒性锚点，冻结）==========
-        print("🔽 加载低质量 Prompt（鲁棒性锚点，冻结）")
+        print("[ANCHOR] Loading low-quality Prompt (robustness anchor, frozen)")
         low_template_type = cfg.TRAINER.BIOMEDDPT_ROBUST.LOW_TEMPLATE_TYPE
         
         if low_template_type not in ZERO_SHOT_TEMPLATES:
-            print(f"⚠️  警告: 未知模板类型 '{low_template_type}'，使用 'minimal'")
+            print(f"警告: 未知模板类型 '{low_template_type}'，使用 'minimal'")
             low_template_type = "minimal"
         
         template = ZERO_SHOT_TEMPLATES[low_template_type]
@@ -202,7 +202,7 @@ class PromptLearner(nn.Module):
             low_text_features = clip_model_temp.encode_text(low_tokenized.cuda())
         
         self.fixed_low_embeddings = low_text_features  # 低质量特征（冻结）
-        print(f"✅ 低质量 Prompt 初始化完成")
+        print(f"[OK] Low-quality Prompt initialized")
         
         # 保存 token 嵌入
         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
@@ -407,7 +407,7 @@ class BiomedDPT_Robust_PubMedCLIP(TrainerX):
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 enabled.add(name)
-        print(f"\n✅ 可训练参数: {enabled}")
+        print(f"\n[OK] Trainable parameters: {enabled}")
         print(f"✅ 参数数量: {len(enabled)}\n")
         
         if cfg.MODEL.INIT_WEIGHTS:

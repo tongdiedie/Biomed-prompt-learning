@@ -210,7 +210,7 @@ class PromptLearner(nn.Module):
         else:
             prompt_prefix = " ".join(["X"] * self.n_ctx)
         
-        print(f'🎯 可学习 Prompt 初始化: "{prompt_prefix}"')
+        print(f'[INIT] Learnable Prompt: \"{prompt_prefix}\"')
         print(f"上下文长度: {self.n_ctx}")
         
         # 使用中等质量模板构造可学习 Prompt
@@ -224,7 +224,7 @@ class PromptLearner(nn.Module):
         nn.init.normal_(self.ctx, std=0.02)
         
         # ========== 2. 加载高质量 Prompt（教师，冻结）==========
-        print("🔼 加载高质量 Prompt（GPT-4 生成，冻结）")
+        print("[TEACHER] Loading high-quality Prompt (GPT-4 generated, frozen)")
         
         with torch.no_grad():
             # 预计算高质量 Prompt 的特征
@@ -246,14 +246,14 @@ class PromptLearner(nn.Module):
                 all_teacher_features.append(text_features.cpu().unsqueeze(1))
 
         self.fixed_embeddings = torch.cat(all_teacher_features, dim=1)  # 高质量特征
-        print(f"✅ 高质量 Prompt 数量: {cfg.TRAINER.BIOMEDDPT_ROBUST.N_PROMPTS} 条/类")
+        print(f"[OK] High-quality Prompts: {cfg.TRAINER.BIOMEDDPT_ROBUST.N_PROMPTS} per class")
         
         # ========== 3. 【关键新增】初始化低质量 Prompt（鲁棒性锚点，冻结）==========
-        print("🔽 加载低质量 Prompt（鲁棒性锚点，冻结）")
+        print("[ANCHOR] Loading low-quality Prompt (robustness anchor, frozen)")
         low_template_type = cfg.TRAINER.BIOMEDDPT_ROBUST.LOW_TEMPLATE_TYPE
         
         if low_template_type not in ZERO_SHOT_TEMPLATES:
-            print(f"⚠️  警告: 未知模板类型 '{low_template_type}'，使用 'minimal'")
+            print(f"警告: 未知模板类型 '{low_template_type}'，使用 'minimal'")
             low_template_type = "minimal"
         
         template = ZERO_SHOT_TEMPLATES[low_template_type]
@@ -282,7 +282,7 @@ class PromptLearner(nn.Module):
             low_text_features = clip_model.encode_text(text_inputs)
         
         self.fixed_low_embeddings = low_text_features.cpu()  # 低质量特征（冻结）
-        print(f"✅ 低质量 Prompt 初始化完成")
+        print(f"[OK] Low-quality Prompt initialized")
 
     def forward(self):
         """
@@ -439,7 +439,7 @@ class BiomedDPT_Robust_PMCCLIP(TrainerX):
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 enabled.add(name)
-        print(f"\n✅ 可训练参数: {enabled}")
+        print(f"\n[OK] Trainable parameters: {enabled}")
         print(f"✅ 参数数量: {len(enabled)}\n")
         
         if cfg.MODEL.INIT_WEIGHTS:

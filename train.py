@@ -50,6 +50,10 @@ import trainers.DPT.dpt_biomedclip
 import trainers.DPT.dpt_clip
 import trainers.MAPLE.maple_biomedclip
 import trainers.MAPLE.maple_clip
+import trainers.BiomedDPT_Robust.biomeddpt_robust_biomedclip
+import trainers.BiomedDPT_Robust.biomeddpt_robust_clip
+import trainers.BiomedDPT_Robust.biomeddpt_robust_pubmedclip
+import trainers.BiomedDPT_Robust.biomeddpt_robust_pmcclip
 
 def print_args(args, cfg):
     print("***************")
@@ -167,6 +171,20 @@ def extend_cfg(cfg):
     cfg.TRAINER.BIOMEDDPT.L1_LAMBDA = 1.0
     cfg.TRAINER.BIOMEDDPT.KL_LAMBDA = 1.0
     cfg.TRAINER.BIOMEDDPT.N_PROMPTS = 50
+
+    # ========== 【关键】添加 BiomedDPT_Robust 配置 ==========
+    cfg.TRAINER.BIOMEDDPT_ROBUST = CN()
+    cfg.TRAINER.BIOMEDDPT_ROBUST.CTX_INIT = "a photo of a"
+    cfg.TRAINER.BIOMEDDPT_ROBUST.CSC = False
+    cfg.TRAINER.BIOMEDDPT_ROBUST.CLASS_TOKEN_POSITION = "middle" # 'middle' or 'end' or 'front'
+    cfg.TRAINER.BIOMEDDPT_ROBUST.N_CTX = 4
+    cfg.TRAINER.BIOMEDDPT_ROBUST.PREC = "fp32"
+    cfg.TRAINER.BIOMEDDPT_ROBUST.N_PROMPTS = 50
+    # 【关键】低质量 Prompt 约束参数
+    cfg.TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_HIGH = 12.5  # λ1：向高质量对齐
+    cfg.TRAINER.BIOMEDDPT_ROBUST.KL_LAMBDA = 0.25       # λ2：知识蒸馏
+    cfg.TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_LOW = 0.3    # λ3：向低质量对齐【新增】
+    cfg.TRAINER.BIOMEDDPT_ROBUST.LOW_TEMPLATE_TYPE = "minimal"  # 低质量模板类型【新增】
     
     cfg.TRAINER.VPT= CN()
     cfg.TRAINER.VPT.CTX_INIT = "a photo of a"  # initialization words

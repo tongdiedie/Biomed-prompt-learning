@@ -83,11 +83,12 @@ if __name__ == "__main__":
 
     # methods = ["BiomedCoOp", "KgCoOp", "CoOp", "CoCoOp", "ProGrad"]
     # datasets = ["btmri", "busi", "chmnist", "covid", "ctkidney", "dermamnist", "kneexray", "kvasir", "lungcolon", "octmnist", "retina"]
-    methods = ["BiomedDPT", "BiomedCoOp", "KgCoOp", "CoOp", "CoCoOp", "ProGrad"]
+    # methods = ["BiomedDPT", "BiomedCoOp", "KgCoOp", "CoOp", "CoCoOp", "ProGrad"]
+    methods = ["BiomedDPT_Robust"]
     datasets = ["btmri"]
 
-    seeds = [1, 2, 3]
-    gpu_ids = [0, 1, 2]  # 假设有 3 块 GPU，可调整
+    seeds = [1]
+    gpu_ids = [0]  # 假设有 3 块 GPU，可调整
 
     # 生成任务列表，并循环分配 GPU
     tasks = [

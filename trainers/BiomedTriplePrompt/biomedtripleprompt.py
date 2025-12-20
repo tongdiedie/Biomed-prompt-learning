@@ -55,7 +55,7 @@ CUSTOM_BIOMEDDPT_TEMPLATES = {
 
 def load_biomedclip_to_cpu(cfg):
     """加载 BiomedCLIP 模型"""
-    print("📦 加载 BiomedCLIP-PubMedBERT_256-vit_base_patch16_224...")
+    print("Loading BiomedCLIP-PubMedBERT_256-vit_base_patch16_224...")
     clip_model, preprocess = create_model_from_pretrained(
         'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
         cache_dir='clip/checkpoints/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
@@ -280,7 +280,7 @@ class TriplePromptLearner(nn.Module):
         self.register_buffer("token_prefix_low", low_quality_embedding[:, :1, :])
         self.register_buffer("token_suffix_low", low_quality_embedding[:, 1 + self.n_ctx:, :])
         
-        print(f"✅ 低质量 Prompt 初始化完成，可学习参数: {self.ctx_low.numel()}")
+        print(f"[OK] Low-quality Prompt initialized，可学习参数: {self.ctx_low.numel()}")
 
     def forward(self):
         """

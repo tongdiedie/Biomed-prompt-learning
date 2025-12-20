@@ -51,9 +51,10 @@ if __name__ == "__main__":
 
     seeds = [1]
     gpu_ids = [0]  # 假设有 3 块 GPU，可调整
-    methods = ["BiomedDPT", "BiomedCoOp", "KgCoOp", "CoOp", "CoCoOp", "ProGrad"]
+    # methods = ["BiomedDPT", "BiomedCoOp", "KgCoOp", "CoOp", "CoCoOp", "ProGrad"]
     # methods = ["CoOp", "Maple", "VPT", "DPT"]
-    models = ["CLIP"]
+    methods = ["BiomedDPT_Robust"]
+    models = ["CLIP", "BiomedCLIP"]
     # 生成任务列表，并循环分配 GPU
     tasks = [
         (method, model, dataset, shot, seed, gpu_ids[(i + j + k + l + h) % len(gpu_ids)])  # 轮流分配 GPU

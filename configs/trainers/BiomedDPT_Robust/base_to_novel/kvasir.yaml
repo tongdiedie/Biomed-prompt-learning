@@ -1,8 +1,8 @@
 DATALOADER:
   TRAIN_X:
-    BATCH_SIZE: 4
+    BATCH_SIZE: 1
   TEST:
-    BATCH_SIZE: 100
+    BATCH_SIZE: 10
   NUM_WORKERS: 8
 
 INPUT:
@@ -32,13 +32,9 @@ TRAINER:
   BIOMEDDPT_ROBUST:
     CTX_INIT: "a endoscopic photo of a"
     N_CTX: 5
-    # PREC: "fp32"
     N_PROMPTS: 50
     
     L1_LAMBDA_HIGH: 10.0
     KL_LAMBDA: 0.5
     L1_LAMBDA_LOW: 0.3
     LOW_TEMPLATE_TYPE: "minimal"
-
-# DATASET:
-#   SUBSAMPLE_CLASSES: "base"
