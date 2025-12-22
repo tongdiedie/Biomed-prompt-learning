@@ -91,16 +91,27 @@ class PromptLearner(nn.Module):
         n_cls = len(classnames)
         n_ctx = cfg.TRAINER.BIOMEDDPT_ROBUST.N_CTX
         ctx_init = cfg.TRAINER.BIOMEDDPT_ROBUST.CTX_INIT
-        dtype = clip_model.dtype
-        ctx_dim = clip_model.text.ln_final.weight.shape[0]
+        dtype = clip_model.text.transformer.dtype
+        ctx_dim = 768
         
+        local_path = 'clip\checkpoints\BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
+        self.tokenizer = get_tokenizer(
+            'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
+            cache_dir=local_path
+        )
+
         # ========== 1. 初始化可学习 Prompt（学生）==========
         if ctx_init and n_ctx <= 4:
             ctx_init = ctx_init.replace("_", " ")
-            prompt = tokenize([ctx_init], context_length=77)[0]
+            prompt = self.tokenizer(ctx_init)
+
+            prompt_tokens = self.tokenizer(ctx_init)
+
             with torch.no_grad():
-                embedding = clip_model.text.token_embedding(prompt).type(dtype)
-            ctx_vectors = embedding[1: 1 + n_ctx, :]
+                embedding = clip_model.text.transformer.embeddings.word_embeddings(
+                    prompt_tokens
+                ).type(dtype)
+            ctx_vectors = embedding[0: 1 + n_ctx, :]
             prompt_prefix = ctx_init
         else:
             ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
@@ -108,7 +119,7 @@ class PromptLearner(nn.Module):
             prompt_prefix = " ".join(["X"] * n_ctx)
         
         print(f'[INIT] Learnable Prompt: \"{prompt_prefix}\"')
-        print(f"上下文长度: {n_ctx}")
+        print(f"Number of context words (tokens) for Language prompting: {n_ctx}")
         self.ctx = nn.Parameter(ctx_vectors)
 
         classnames = [name.replace("_", " ") for name in classnames]
@@ -117,23 +128,23 @@ class PromptLearner(nn.Module):
         temp = CUSTOM_BIOMEDDPT_TEMPLATES[cfg.DATASET.NAME]
         prompts = [temp.format(c.replace("_", " ")) for c in classnames]
 
-        tokenized_prompts = torch.cat([tokenize([p], context_length=77) for p in prompts])
-        
+        # tokenized_prompts = torch.cat([tokenize([p], context_length=77) for p in prompts])
+        tokenized_prompts = self.tokenizer(prompts)
+
         # ========== 2. 加载高质量 Prompt（教师，冻结）==========
         print("[TEACHER] Loading high-quality Prompt (GPT-4 generated, frozen)")
         clip_model_temp, _ = load_biomedclip_to_cpu(cfg)
         clip_model_temp = clip_model_temp.float().cuda()
         
         with torch.no_grad():
-            embedding = clip_model.text.token_embedding(tokenized_prompts).type(dtype)
+            embedding = clip_model.text.transformer.embeddings.word_embeddings(
+                tokenized_prompts
+            ).type(dtype)
             
-            # 预计算高质量 Prompt 的特征
+            # Now pre-compute the frozen VL embeddings
             all_teacher_features = []
             for i in range(cfg.TRAINER.BIOMEDDPT_ROBUST.N_PROMPTS):
-                x_tokenized = torch.cat([
-                    tokenize([BIOMEDDPT_TEMPLATES[classname][i]], context_length=77) 
-                    for classname in classnames
-                ])
+                x_tokenized = torch.cat([self.tokenizer(BIOMEDDPT_TEMPLATES[classname][i]) for classname in classnames])
                 text_features = clip_model_temp.encode_text(x_tokenized.cuda())
                 all_teacher_features.append(text_features.unsqueeze(1))
 
@@ -163,10 +174,8 @@ class PromptLearner(nn.Module):
         
         # 预计算低质量 Prompt 的特征
         with torch.no_grad():
-            low_tokenized = torch.cat([
-                tokenize([p if p else "X"], context_length=77) for p in low_quality_prompts
-            ])
-            low_text_features = clip_model_temp.encode_text(low_tokenized.cuda())
+            low_tokenized = self.tokenizer(low_quality_prompts).cuda()
+            low_text_features = clip_model_temp.encode_text(low_tokenized, normalize=True)
         
         self.fixed_low_embeddings = low_text_features  # 低质量特征（冻结）
         print(f"[OK] Low-quality Prompt initialized")
@@ -178,6 +187,7 @@ class PromptLearner(nn.Module):
         self.n_cls = n_cls
         self.n_ctx = n_ctx
         self.tokenized_prompts = tokenized_prompts
+        self.class_token_position = cfg.TRAINER.BIOMEDDPT_ROBUST.CLASS_TOKEN_POSITION
 
     def construct_prompts(self, ctx, prefix, suffix):
         """构造完整的 Prompt"""
@@ -208,7 +218,7 @@ class CLIP_Inplanted(nn.Module):
         super().__init__()
         self.clipmodel = clip_model
         self.image_encoder = clip_model.visual
-        self.dtype = clip_model.dtype
+        self.dtype = clip_model.text.transformer.dtype
         
         # Visual Prompt 参数
         self.num_tokens = 4
@@ -365,7 +375,7 @@ class BiomedDPT_Robust_BiomedCLIP(TrainerX):
         print(f"Building BiomedDPT_Robust model (BiomedCLIP backbone)")
         print(f"{'='*80}\n")
         
-        print(f"加载 BiomedCLIP-PubMedBERT_256-vit_base_patch16_224")
+        print(f"Loading BiomedCLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model, _ = load_biomedclip_to_cpu(cfg)
 
         if cfg.TRAINER.BIOMEDDPT_ROBUST.PREC == "fp32" or cfg.TRAINER.BIOMEDDPT_ROBUST.PREC == "amp":
@@ -403,7 +413,7 @@ class BiomedDPT_Robust_BiomedCLIP(TrainerX):
         
         device_count = torch.cuda.device_count()
         if device_count > 1:
-            print(f"检测到多 GPU ({device_count} 个)，使用全部！")
+            print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
             self.model = nn.DataParallel(self.model)
         
         print(f"{'='*80}\n")
@@ -473,4 +483,5 @@ class BiomedDPT_Robust_BiomedCLIP(TrainerX):
                 del state_dict["prompt_learner.token_suffix"]
 
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
+            # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)

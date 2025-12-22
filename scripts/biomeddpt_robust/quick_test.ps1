@@ -7,7 +7,7 @@
 
 $env:CUDA_VISIBLE_DEVICES = "0"
 
-Write-Host "`n🧪 快速测试 BiomedDPT_Robust（5 epochs）`n" -ForegroundColor Cyan
+Write-Host "`quickly test BiomedDPT_Robust(5 epochs)`n" -ForegroundColor Cyan
 
 python train.py `
     --root data `
@@ -20,4 +20,4 @@ python train.py `
     DATASET.NUM_SHOTS 16 `
     OPTIM.MAX_EPOCH 5
 
-Write-Host "`n✅ 快速测试完成！`n" -ForegroundColor Green
+Write-Host "`test completely`n" -ForegroundColor Green
