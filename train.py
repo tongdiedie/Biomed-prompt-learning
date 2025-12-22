@@ -290,7 +290,7 @@ if __name__ == "__main__":
     parser.add_argument("--trainer", type=str, default="DPT_BiomedCLIP", help="name of trainer")
     parser.add_argument("--backbone", type=str, default="", help="name of CNN backbone")
     parser.add_argument("--head", type=str, default="", help="name of head")
-    parser.add_argument("--eval-only", action="store_true", default=True,help="evaluation only")
+    parser.add_argument("--eval-only", action="store_true", default=False,help="evaluation only") # True
     parser.add_argument(
         "--model-dir",
         type=str,

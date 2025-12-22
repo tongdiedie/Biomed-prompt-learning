@@ -3,404 +3,283 @@ BiomedDPT_Robust (PMC-CLIP backbone)
 ====================================
 BiomedDPT + 低质量 Prompt 鲁棒性增强（PMC-CLIP 版本）
 
-核心改进:
-在 L1 损失中添加低质量 Prompt 约束，让模型同时学习：
-1. 细粒度语义（从高质量 Prompt）
-2. 核心语义（从低质量 Prompt）
-
-损失函数:
-L = L_ce + λ1 * L_L1_high + λ2 * L_KL + λ3 * L_L1_low
-
-文件位置：trainers/BiomedDPT_Robust/biomeddpt_robust_pmcclip.py
+核心改进：在原有 BiomedDPT_PMCCLIP 基础上添加低质量 Prompt 约束
+损失函数：L = L_ce + λ1 * L_L1_high + λ2 * L_KL + λ3 * L_L1_low
 """
 
 import copy
 import os
 import os.path as osp
 import numpy as np
+import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.cuda.amp import GradScaler, autocast
+import requests
+from tqdm import tqdm
 
 from dassl.engine import TRAINER_REGISTRY, TrainerX
 from dassl.utils import load_pretrained_weights, load_checkpoint
 from dassl.optim import build_optimizer, build_lr_scheduler
 from dassl.metrics import compute_accuracy
 
-# 导入 Prompt 模板
-from trainers.prompt_templates import (
-    BIOMEDDPT_TEMPLATES,        # 高质量 GPT-4 Prompt
-    CUSTOM_BIOMEDDPT_TEMPLATES, # 中等质量模板
-    ZERO_SHOT_TEMPLATES         # 【新增】低质量 Prompt
-)
+from trainers.prompt_templates import BIOMEDDPT_TEMPLATES
+from trainers.prompt_templates import CUSTOM_BIOMEDDPT_TEMPLATES
+from trainers.prompt_templates import ZERO_SHOT_TEMPLATES  # 【新增】导入低质量模板
 
-from transformers import AutoTokenizer
-import requests
-from tqdm import tqdm
+from clip.pmcclip import ModifiedResNet
+from transformers import AutoTokenizer, AutoModel
+
+directory = "clip/checkpoints"
+files = {
+    "text_encoder.pth": "clip/checkpoints/text_encoder.pth",
+    "image_encoder(resnet50).pth": "clip/checkpoints/image_encoder(resnet50).pth",
+    "text_projection_layer.pth": "clip/checkpoints/text_projection_layer.pth",
+}
 
 
-def load_pmcclip_to_cpu():
-    """加载 PMC-CLIP 模型到 CPU"""
-    print("📦 加载 PMC-CLIP (ResNet50) 模型...")
-    
-    directory = "clip/checkpoints"
-    os.makedirs(directory, exist_ok=True)
-    
-    # PMC-CLIP 模型文件下载链接
-    pmcclip_files = {
-        "text_encoder.pth": "https://huggingface.co/axiong/pmc_oa_beta/resolve/main/checkpoint.pt",
-        "image_encoder(resnet50).pth": "https://huggingface.co/axiong/pmc_oa_beta/resolve/main/model.pth",
-        "text_projection_layer.pth": "https://huggingface.co/axiong/pmc_oa_beta/resolve/main/projection.pth"
-    }
-    
-    # 检查并下载模型文件
-    for filename, url in pmcclip_files.items():
-        filepath = os.path.join(directory, filename)
-        
-        if not os.path.exists(filepath):
-            print(f"下载 {filename}...")
-            response = requests.get(url, stream=True)
-            total_size = int(response.headers.get('content-length', 0))
-            
-            with open(filepath, 'wb') as file, tqdm(
-                desc=filename,
-                total=total_size,
-                unit='B',
-                unit_scale=True,
-                unit_divisor=1024,
-            ) as bar:
-                for data in response.iter_content(chunk_size=1024):
-                    size = file.write(data)
-                    bar.update(size)
-            print(f"✅ {filename} 下载完成")
-        else:
-            print(f"✅ {filename} 已存在")
-    
-    # 下载 tokenizer
-    tokenizer_path = os.path.join(directory, "BiomedNLP-BiomedBERT-base-uncased-abstract")
-    if not os.path.exists(tokenizer_path):
-        print("下载 BiomedBERT tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained(
-            "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract",
-            cache_dir=tokenizer_path
-        )
+def download_file(url, filepath):
+    print(f"Downloading {filepath}...")
+    response = requests.get(url, stream=True)
+    if response.status_code == 200:
+        total_size = int(response.headers.get('content-length', 0))
+        with open(filepath, "wb") as file:
+            with tqdm(total=total_size, unit='B', unit_scale=True, desc=filepath) as pbar:
+                for chunk in response.iter_content(chunk_size=1024):
+                    file.write(chunk)
+                    pbar.update(len(chunk))
+        print(f"{filepath} downloaded successfully.")
     else:
-        print("✅ BiomedBERT tokenizer 已存在")
-    
-    # 构建模型（简化版，实际需要根据 PMC-CLIP 架构调整）
-    import torchvision.models as models
-    
-    class PMCCLIPModel:
-        def __init__(self):
-            # 图像编码器（ResNet50）
-            self.image_encoder = models.resnet50(pretrained=False)
-            self.image_encoder.fc = nn.Identity()  # 移除分类层
-            image_state_dict = torch.load(
-                os.path.join(directory, "image_encoder(resnet50).pth"),
-                map_location="cpu"
-            )
-            self.image_encoder.load_state_dict(image_state_dict)
-            
-            # 文本编码器（BiomedBERT）
-            from transformers import AutoModel
-            self.text_encoder = AutoModel.from_pretrained(
-                "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract",
-                cache_dir=tokenizer_path
-            )
-            text_state_dict = torch.load(
-                os.path.join(directory, "text_encoder.pth"),
-                map_location="cpu"
-            )
-            self.text_encoder.load_state_dict(text_state_dict)
-            
-            # 投影层
-            self.text_projection = nn.Linear(768, 2048)
-            proj_state_dict = torch.load(
-                os.path.join(directory, "text_projection_layer.pth"),
-                map_location="cpu"
-            )
-            self.text_projection.load_state_dict(proj_state_dict)
-            
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract",
-                cache_dir=tokenizer_path
-            )
-            
-            self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-            self.dtype = torch.float32
-        
-        def encode_text(self, text_inputs):
-            """编码文本"""
-            outputs = self.text_encoder(**text_inputs)
-            text_features = outputs.last_hidden_state[:, 0, :]  # [CLS] token
-            text_features = self.text_projection(text_features)
-            return text_features
-        
-        def encode_image(self, images):
-            """编码图像"""
-            return self.image_encoder(images)
-    
-    model = PMCCLIPModel()
-    return model
+        print(f"Failed to download {filepath}. HTTP Status Code: {response.status_code}")
 
 
 class TextEncoder(nn.Module):
-    """文本编码器（PMC-CLIP 的 BiomedBERT）"""
-    def __init__(self, clip_model):
+    """文本编码器（与 biomeddpt_pmcclip.py 完全相同）"""
+    def __init__(self, pmcclip_model):
         super().__init__()
-        self.text_encoder = clip_model.text_encoder
-        self.text_projection = clip_model.text_projection
-        self.tokenizer = clip_model.tokenizer
-        self.dtype = clip_model.dtype
+        self.model = pmcclip_model
+        self.dtype = torch.float32
+        self.text_encoder = pmcclip_model.text_encoder
+        self.text_projection_layer = pmcclip_model.text_projection_layer
 
-    def forward(self, prompts, tokenized_prompts=None):
-        """
-        前向传播
-        
-        注意：PMC-CLIP 使用 BiomedBERT tokenizer，不同于 CLIP
-        """
-        # 如果 prompts 是文本列表，先 tokenize
-        if isinstance(prompts, list):
-            text_inputs = self.tokenizer(
-                prompts,
-                padding=True,
-                truncation=True,
-                max_length=77,
-                return_tensors="pt"
-            ).to(next(self.text_encoder.parameters()).device)
-        else:
-            # 如果是预编码的嵌入，直接使用
-            text_inputs = {"input_ids": prompts}
-        
-        # 提取文本特征
-        outputs = self.text_encoder(**text_inputs)
-        text_features = outputs.last_hidden_state[:, 0, :]  # [CLS] token
-        text_features = self.text_projection(text_features)
-        
-        return text_features
+    def forward(self, prompts, tokenized_prompts):
+        output = self.text_encoder(inputs_embeds=prompts.cuda(), attention_mask=tokenized_prompts['attention_mask'].cuda())
+        pooler_output = output.pooler_output
+        text_feature = pooler_output @ self.text_projection_layer
+        return text_feature
 
 
 class PromptLearner(nn.Module):
-    """
-    鲁棒性增强的 Prompt 学习器（PMC-CLIP 版本）
-    
-    包含:
-    1. 高质量 Prompt（教师，冻结）：GPT-4 生成
-    2. 低质量 Prompt（参考锚点，冻结）：类别名
-    3. 可学习 Prompt（学生）：需同时向高质量和低质量对齐
-    
-    注意：PMC-CLIP 使用 BiomedBERT tokenizer，处理方式不同于 CLIP
-    """
-    def __init__(self, cfg, classnames, clip_model):
+    """Prompt 学习器（在原有基础上添加低质量 Prompt 约束）"""
+    def __init__(self, cfg, classnames, pmcclip_model):
         super().__init__()
-        self.cfg = cfg
-        self.classnames = classnames
-        self.n_cls = len(classnames)
-        self.n_ctx = cfg.TRAINER.BIOMEDDPT_ROBUST.N_CTX
-        self.dtype = clip_model.dtype
-        self.tokenizer = clip_model.tokenizer
-        
-        # ========== 1. 初始化可学习 Prompt（学生）==========
+        n_cls = len(classnames)
+        n_ctx = cfg.TRAINER.BIOMEDDPT_ROBUST.N_CTX
         ctx_init = cfg.TRAINER.BIOMEDDPT_ROBUST.CTX_INIT
-        
-        if ctx_init and self.n_ctx <= 4:
+        dtype = torch.float32
+        ctx_dim = 768
+        clip_imsize = 224
+        cfg_imsize = cfg.INPUT.SIZE[0]
+        self.tokenizer = AutoTokenizer.from_pretrained('clip/checkpoints/BiomedNLP-BiomedBERT-base-uncased-abstract')
+        assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+
+        # 初始化可学习上下文向量（与原版相同）
+        if ctx_init:
             ctx_init = ctx_init.replace("_", " ")
+            prompt = self.tokenizer(ctx_init, padding='max_length', truncation=True, max_length=77, return_tensors='pt')['input_ids']
+            with torch.no_grad():
+                embedding = pmcclip_model.text_encoder.embeddings.word_embeddings(prompt.cuda()).type(dtype)
+            ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
             prompt_prefix = ctx_init
         else:
-            prompt_prefix = " ".join(["X"] * self.n_ctx)
+            ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+            nn.init.normal_(ctx_vectors, std=0.02)
+            prompt_prefix = " ".join(["X"] * n_ctx)
         
-        print(f'[INIT] Learnable Prompt: \"{prompt_prefix}\"')
-        print(f"上下文长度: {self.n_ctx}")
-        
-        # 使用中等质量模板构造可学习 Prompt
-        classnames = [name.replace("_", " ") for name in classnames]
-        temp = CUSTOM_BIOMEDDPT_TEMPLATES[cfg.DATASET.NAME]
-        self.prompts_template = [temp.format(c.replace("_", " ")) for c in classnames]
-        
-        # 对于 PMC-CLIP，我们直接优化文本表示
-        # 这里简化为可学习的嵌入向量
-        self.ctx = nn.Parameter(torch.randn(self.n_cls, 768, dtype=self.dtype))  # 768 是 BiomedBERT 的隐藏维度
-        nn.init.normal_(self.ctx, std=0.02)
-        
-        # ========== 2. 加载高质量 Prompt（教师，冻结）==========
-        print("[TEACHER] Loading high-quality Prompt (GPT-4 generated, frozen)")
-        
-        with torch.no_grad():
-            # 预计算高质量 Prompt 的特征
-            all_teacher_features = []
-            for i in range(cfg.TRAINER.BIOMEDDPT_ROBUST.N_PROMPTS):
-                high_quality_prompts = [
-                    BIOMEDDPT_TEMPLATES[classname][i] 
-                    for classname in classnames
-                ]
-                text_inputs = self.tokenizer(
-                    high_quality_prompts,
-                    padding=True,
-                    truncation=True,
-                    max_length=77,
-                    return_tensors="pt"
-                ).to("cuda")
-                
-                text_features = clip_model.encode_text(text_inputs)
-                all_teacher_features.append(text_features.cpu().unsqueeze(1))
+        print(f'Initial text context: "{prompt_prefix}"')
+        print(f"Number of context words (tokens) for Language prompting: {n_ctx}")
+        self.ctx = nn.Parameter(ctx_vectors)
 
-        self.fixed_embeddings = torch.cat(all_teacher_features, dim=1)  # 高质量特征
-        print(f"[OK] High-quality Prompts: {cfg.TRAINER.BIOMEDDPT_ROBUST.N_PROMPTS} per class")
+        classnames = [name.replace("_", " ") for name in classnames]
+        name_lens = [len(self.tokenizer(name, padding='max_length', truncation=True, max_length=77, return_tensors='pt')['input_ids']) for name in classnames]
+        temp = CUSTOM_BIOMEDDPT_TEMPLATES[cfg.DATASET.NAME]
+        prompts = [temp.format(c.replace("_", " ")) for c in classnames]
+        tokenized_prompts = self.tokenizer(prompts, padding='max_length', truncation=True, max_length=77, return_tensors='pt')
+
+        with torch.no_grad():
+            embedding = pmcclip_model.text_encoder.embeddings.word_embeddings(tokenized_prompts['input_ids'].cuda()).type(dtype)
+            
+            # 预计算高质量特征（与原版相同）
+            all_teacher_features = []
+            num_temp = cfg.TRAINER.BIOMEDDPT_ROBUST.N_PROMPTS
+            for i in range(num_temp):
+                x_tokenized = torch.cat([self.tokenizer(BIOMEDDPT_TEMPLATES[classname][i], padding='max_length', truncation=True, max_length=77, return_tensors='pt')['input_ids'] for classname in classnames])
+                x_tokenized_attn_masks = torch.cat([self.tokenizer(BIOMEDDPT_TEMPLATES[classname][i], padding='max_length', truncation=True, max_length=77, return_tensors='pt')['attention_mask'] for classname in classnames])
+                text_features = pmcclip_model.text_encoder(x_tokenized.cuda(), x_tokenized_attn_masks.cuda())
+                pooler_output = text_features.pooler_output
+                text_features = pooler_output @ pmcclip_model.text_projection_layer
+                all_teacher_features.append(text_features.unsqueeze(1))
+
+        self.fixed_embeddings = torch.cat(all_teacher_features, dim=1)
         
-        # ========== 3. 【关键新增】初始化低质量 Prompt（鲁棒性锚点，冻结）==========
-        print("[ANCHOR] Loading low-quality Prompt (robustness anchor, frozen)")
+        # ========== 【关键新增】预计算低质量特征 ==========
+        print("[ANCHOR] Loading low-quality Prompt (robustness anchor)")
         low_template_type = cfg.TRAINER.BIOMEDDPT_ROBUST.LOW_TEMPLATE_TYPE
-        
         if low_template_type not in ZERO_SHOT_TEMPLATES:
-            print(f"警告: 未知模板类型 '{low_template_type}'，使用 'minimal'")
+            print(f"Warning: Unknown template type '{low_template_type}', using 'minimal'")
             low_template_type = "minimal"
-        
         template = ZERO_SHOT_TEMPLATES[low_template_type]
-        print(f"低质量模板类型: {low_template_type}")
+        print(f"Low-quality template type: {low_template_type}")
         
-        # 生成低质量 Prompt
         if template == "":
-            low_quality_prompts = ["" for _ in classnames]
-            print("使用空字符串作为低质量 Prompt")
+            low_quality_prompts = ["X" for _ in classnames]
+            print("Using 'X' as low-quality prompt")
         else:
             low_quality_prompts = [template.format(**{"class": cls}) for cls in classnames]
-            print(f"生成的低质量 Prompt 示例:")
+            print(f"Low-quality prompt examples (first 3):")
             for cls, prompt in zip(classnames[:3], low_quality_prompts[:3]):
                 print(f"  {cls:15} -> '{prompt}'")
         
-        # 预计算低质量 Prompt 的特征
         with torch.no_grad():
-            text_inputs = self.tokenizer(
-                [p if p else "X" for p in low_quality_prompts],
-                padding=True,
-                truncation=True,
-                max_length=77,
-                return_tensors="pt"
-            ).to("cuda")
-            
-            low_text_features = clip_model.encode_text(text_inputs)
+            low_tokenized = torch.cat([self.tokenizer(p if p else "X", padding='max_length', truncation=True, max_length=77, return_tensors='pt')['input_ids'] for p in low_quality_prompts])
+            low_tokenized_attn_masks = torch.cat([self.tokenizer(p if p else "X", padding='max_length', truncation=True, max_length=77, return_tensors='pt')['attention_mask'] for p in low_quality_prompts])
+            low_text_features = pmcclip_model.text_encoder(low_tokenized.cuda(), low_tokenized_attn_masks.cuda())
+            pooler_output = low_text_features.pooler_output
+            low_text_features = pooler_output @ pmcclip_model.text_projection_layer
         
-        self.fixed_low_embeddings = low_text_features.cpu()  # 低质量特征（冻结）
-        print(f"[OK] Low-quality Prompt initialized")
+        self.fixed_low_embeddings = low_text_features
+        print(f"[OK] Low-quality Prompt initialized\n")
+
+        self.register_buffer("token_prefix", embedding[:, :1, :])
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])
+
+        self.n_cls = n_cls
+        self.n_ctx = n_ctx
+        self.tokenized_prompts = tokenized_prompts
+        self.name_lens = name_lens
+
+    def construct_prompts(self, ctx, prefix, suffix, label=None):
+        if label is not None:
+            prefix = prefix[label]
+            suffix = suffix[label]
+        prompts = torch.cat([prefix, ctx, suffix], dim=1)
+        return prompts
 
     def forward(self):
-        """
-        返回可学习 Prompt 的文本列表
-        
-        返回:
-            prompts: 可学习 Prompt 文本列表
-        """
-        # 返回模板文本（实际训练时会通过 ctx 调整表示）
-        return self.prompts_template
+        ctx = self.ctx
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+
+        prefix = self.token_prefix
+        suffix = self.token_suffix
+        prompts = self.construct_prompts(ctx, prefix, suffix)
+        return prompts
+
+
+class PMCCLIP(nn.Module):
+    """PMC-CLIP 模型（与原版相同）"""
+    def __init__(self, image_encoder, text_encoder, projection_layer):
+        super().__init__()
+        self.image_encoder = image_encoder
+        self.text_encoder = text_encoder
+        self.text_projection_layer = projection_layer
+        self.logit_scale = 4.4292
+        self.tokenizer = AutoTokenizer.from_pretrained('clip/checkpoints/BiomedNLP-BiomedBERT-base-uncased-abstract')
+
+    def forward(self, image, text):
+        encoded_input = self.tokenizer(text, padding='max_length', truncation=True, max_length=77, return_tensors='pt')
+        input_ids = encoded_input['input_ids']
+        text_feature = self.text_encoder(input_ids)
+        pooler_output = text_feature.pooler_output
+        text_feature = pooler_output @ self.text_projection_layer
+        image_feature = self.image_encoder(image)
+        if isinstance(image_feature, dict):
+            image_feature = image_feature['image_features']
+        return image_feature, text_feature
 
 
 class CLIP_Inplanted(nn.Module):
-    """带 Visual Prompt 的图像编码器（PMC-CLIP 版本，ResNet50）"""
+    """带 Visual Prompt 的图像编码器（与原版相同）"""
     def __init__(self, clip_model):
         super().__init__()
+        self.clipmodel = clip_model
         self.image_encoder = clip_model.image_encoder
-        self.dtype = clip_model.dtype
-        
-        # Visual Prompt 参数（调整为 ResNet50 的输入维度）
+        self.dtype = torch.float32
         self.num_tokens = 4
-        self.prompt_dim = 2048  # ResNet50 的输出维度
-        
-        # 注意：对于 ResNet，Visual Prompt 的注入方式需要调整
-        # 这里简化为在特征层面添加可学习的偏置
-        self.prompt_bias = nn.Parameter(torch.zeros(1, self.prompt_dim))
-        nn.init.normal_(self.prompt_bias, std=0.02)
+        self.prompt_embeddings = nn.Parameter(torch.zeros(1, self.num_tokens, 56, 56))
+        self.deep_prompt_embeddings_1 = nn.Parameter(torch.zeros(1, self.num_tokens, 56, 56))
+        self.deep_prompt_embeddings_2 = nn.Parameter(torch.zeros(1, self.num_tokens, 28, 28))
+        self.deep_prompt_embeddings_3 = nn.Parameter(torch.zeros(1, self.num_tokens, 14, 14))
+        self.deep_prompt_embeddings_4 = nn.Parameter(torch.zeros(1, self.num_tokens, 7, 7))
+        self.prompt_dropout = nn.Dropout(0.5)
 
     def forward(self, x):
-        """前向传播（ResNet50）"""
-        features = self.image_encoder(x)
+        x = self.image_encoder.relu1(self.image_encoder.bn1(self.image_encoder.conv1(x)))
+        x = self.image_encoder.relu2(self.image_encoder.bn2(self.image_encoder.conv2(x)))
+        x = self.image_encoder.relu3(self.image_encoder.bn3(self.image_encoder.conv3(x)))
+        x = self.image_encoder.avgpool(x)
         
-        # 添加可学习的 Visual Prompt（简化版）
-        features = features + self.prompt_bias
-        
-        return features
+        B = x.shape[0]
+        x = torch.cat((x[:, :1, :], self.prompt_dropout(self.prompt_embeddings.expand(B, -1, -1, -1)), x[:, 1+self.num_tokens:, :]), dim=1)
+        x = self.image_encoder.layer1(x)
+        x = torch.cat((x[:, :1, :], self.prompt_dropout(self.deep_prompt_embeddings_1.expand(B, -1, -1, -1)), x[:, 1+self.num_tokens:, :]), dim=1)
+        x = self.image_encoder.layer2(x)
+        x = torch.cat((x[:, :1, :], self.prompt_dropout(self.deep_prompt_embeddings_2.expand(B, -1, -1, -1)), x[:, 1+self.num_tokens:, :]), dim=1)
+        x = self.image_encoder.layer3(x)
+        x = torch.cat((x[:, :1, :], self.prompt_dropout(self.deep_prompt_embeddings_3.expand(B, -1, -1, -1)), x[:, 1+self.num_tokens:, :]), dim=1)
+        x = self.image_encoder.layer4(x)
+        x = torch.cat((x[:, :1, :], self.prompt_dropout(self.deep_prompt_embeddings_4.expand(B, -1, -1, -1)), x[:, 1+self.num_tokens:, :]), dim=1)
+        x = self.image_encoder.attnpool(x)
+        return x
 
 
 class CustomCLIP(nn.Module):
-    """鲁棒性增强的 PMC-CLIP 模型"""
-    def __init__(self, cfg, classnames, clip_model):
+    """自定义 CLIP（在原版基础上添加低质量 Prompt 损失）"""
+    def __init__(self, cfg, classnames, pmcclip_model):
         super().__init__()
-        self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
-        self.image_encoder = CLIP_Inplanted(clip_model)
-        self.text_encoder = TextEncoder(clip_model)
-        self.logit_scale = clip_model.logit_scale
-        self.dtype = clip_model.dtype
+        self.prompt_learner = PromptLearner(cfg, classnames, pmcclip_model)
+        self.cfg = cfg
+        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        self.image_encoder = CLIP_Inplanted(pmcclip_model)
+        self.text_encoder = TextEncoder(pmcclip_model)
+        self.logit_scale = pmcclip_model.logit_scale
+        self.dtype = torch.float32
         self.total_epochs = cfg.OPTIM.MAX_EPOCH
         self.n_cls = len(classnames)
-        self.cfg = cfg
 
     def forward(self, image, label=None):
-        """
-        前向传播
-        
-        计算损失:
-        L = L_ce + λ1 * L_L1_high + λ2 * L_KL + λ3 * L_L1_low
-        """
-        logit_scale = self.logit_scale.exp()
+        tokenized_prompts = self.tokenized_prompts
+        logit_scale = math.exp(self.logit_scale)
 
-        # 获取可学习 Prompt（文本列表）
         prompts = self.prompt_learner()
-
-        # 提取特征
-        text_features = self.text_encoder(prompts)
-        
-        # 添加可学习的上下文调整
-        text_features = text_features + self.prompt_learner.ctx
-        
+        text_features = self.text_encoder(prompts, tokenized_prompts)
         image_features = self.image_encoder(image.type(self.dtype))
         
-        # 归一化
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         
-        # 高质量特征（教师）
         fixed_embeddings = self.prompt_learner.fixed_embeddings
         fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
         fixed_embeddings = fixed_embeddings.mean(dim=1)
         fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
         
-        # 【关键新增】低质量特征（鲁棒性锚点）
+        # 【关键新增】低质量特征
         fixed_low_embeddings = self.prompt_learner.fixed_low_embeddings
         fixed_low_embeddings = fixed_low_embeddings / fixed_low_embeddings.norm(dim=-1, keepdim=True)
         
-        # 计算 logits
         zero_shot_logits = logit_scale * image_features @ fixed_embeddings.cuda().t()
         logits = logit_scale * image_features @ text_features.t()
         
         if self.prompt_learner.training:
-            # ========== 损失 1：交叉熵损失 ==========
             loss_ce = F.cross_entropy(logits, label)
+            loss_l1_high = F.l1_loss(text_features, fixed_embeddings.cuda(), reduction='mean') * self.cfg.TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_HIGH
+            loss_kl = F.kl_div(F.log_softmax(logits, dim=1), F.log_softmax(zero_shot_logits, dim=1), reduction='sum', log_target=True) / logits.numel() * self.cfg.TRAINER.BIOMEDDPT_ROBUST.KL_LAMBDA
             
-            # ========== 损失 2：L1 对齐损失（可学习 → 高质量）==========
-            loss_l1_high = F.l1_loss(
-                text_features, 
-                fixed_embeddings.cuda(), 
-                reduction='mean'
-            ) * self.cfg.TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_HIGH
+            # 【关键新增】低质量 Prompt 约束
+            loss_l1_low = F.l1_loss(text_features, fixed_low_embeddings.cuda(), reduction='mean') * self.cfg.TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_LOW
             
-            # ========== 损失 3：KL 散度损失（知识蒸馏）==========
-            loss_kl = F.kl_div(
-                F.log_softmax(logits, dim=1),
-                F.log_softmax(zero_shot_logits, dim=1),
-                reduction='sum',
-                log_target=True
-            ) / logits.numel() * self.cfg.TRAINER.BIOMEDDPT_ROBUST.KL_LAMBDA
-            
-            # ========== 【关键新增】损失 4：L1 鲁棒性约束（可学习 → 低质量）==========
-            loss_l1_low = F.l1_loss(
-                text_features, 
-                fixed_low_embeddings.cuda(), 
-                reduction='mean'
-            ) * self.cfg.TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_LOW
-            
-            # ========== 总损失 ==========
             total_loss = loss_ce + loss_l1_high + loss_kl + loss_l1_low
-            
             return logits, total_loss
         else:
             return logits
@@ -408,7 +287,7 @@ class CustomCLIP(nn.Module):
 
 @TRAINER_REGISTRY.register()
 class BiomedDPT_Robust_PMCCLIP(TrainerX):
-    """BiomedDPT_Robust 训练器（PMC-CLIP backbone）"""
+    """训练器（与 biomeddpt_pmcclip.py 完全相同）"""
     
     def check_cfg(self, cfg):
         assert cfg.TRAINER.BIOMEDDPT_ROBUST.PREC in ["fp16", "fp32", "amp"]
@@ -417,30 +296,44 @@ class BiomedDPT_Robust_PMCCLIP(TrainerX):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
 
-        print(f"\n{'='*80}")
-        print(f"🚀 构建 BiomedDPT_Robust 模型（PMC-CLIP backbone）")
-        print(f"{'='*80}\n")
-        
-        print(f"加载 PMC-CLIP (ResNet50 + BiomedBERT)")
-        clip_model = load_pmcclip_to_cpu()
+        for filename, url in files.items():
+            filepath = os.path.join(directory, filename)
+            if not os.path.exists(filepath):
+                print(f"{filename} not found in {directory}. Downloading...")
+                download_file(url, filepath)
+            else:
+                print(f"{filename} already exists in {directory}.")
 
-        print("构建自定义 PMC-CLIP 模型")
-        self.model = CustomCLIP(cfg, classnames, clip_model)
+        print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
+        image_encoder = ModifiedResNet(layers=[3, 4, 6, 3], output_dim=768, heads=8, image_size=224, width=64)
+        image_encoder.load_state_dict(torch.load(os.path.join(directory, 'image_encoder(resnet50).pth'), weights_only=True))
+        text_encoder = AutoModel.from_pretrained('clip/checkpoints/BiomedNLP-BiomedBERT-base-uncased-abstract')
+        text_encoder.load_state_dict(torch.load(os.path.join(directory, 'text_encoder.pth'), weights_only=True))
+        text_projection_layer = torch.load(os.path.join(directory, 'text_projection_layer.pth'), weights_only=True)
+        text_projection_layer = nn.Parameter(text_projection_layer)
 
-        print("冻结图像和文本编码器，仅优化 Prompt")
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        image_encoder = image_encoder.to(device).eval()
+        text_encoder = text_encoder.to(device).eval()
+        text_projection_layer = text_projection_layer.to(device)
+
+        pmcclip_model = PMCCLIP(image_encoder, text_encoder, text_projection_layer).to(device).eval()
+
+        print("Building custom CLIP")
+        self.model = CustomCLIP(cfg, classnames, pmcclip_model)
+
+        print("Turning off gradients in both the image and the text encoder")
         names_to_update = ["prompt_learner.ctx"]
-
         for name, param in self.model.named_parameters():
             if name not in names_to_update:
                 param.requires_grad_(False)
 
-        # 检查可训练参数
         enabled = set()
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 enabled.add(name)
-        print(f"\n[OK] Trainable parameters: {enabled}")
-        print(f"✅ 参数数量: {len(enabled)}\n")
+        print(f"Parameters to be updated: {enabled}")
+        print(f"Parameters count: {len(enabled)}")
         
         if cfg.MODEL.INIT_WEIGHTS:
             load_pretrained_weights(self.model, cfg.MODEL.INIT_WEIGHTS)
@@ -456,14 +349,11 @@ class BiomedDPT_Robust_PMCCLIP(TrainerX):
         
         device_count = torch.cuda.device_count()
         if device_count > 1:
-            print(f"检测到多 GPU ({device_count} 个)，使用全部！")
+            print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
             self.model = nn.DataParallel(self.model)
-        
-        print(f"{'='*80}\n")
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
-
         model = self.model
         optim = self.optim
         scaler = self.scaler
@@ -480,14 +370,9 @@ class BiomedDPT_Robust_PMCCLIP(TrainerX):
             logits, loss = model(image, label)
             self.model_backward_and_update(loss)
 
-        loss_summary = {
-            "loss": loss.item(),
-            "acc": compute_accuracy(logits, label)[0].item(),
-        }
-
+        loss_summary = {"loss": loss.item(), "acc": compute_accuracy(logits, label)[0].item()}
         if (self.batch_idx + 1) == self.num_batches:
             self.update_lr()
-
         return loss_summary
 
     def parse_batch_train(self, batch):
@@ -504,19 +389,23 @@ class BiomedDPT_Robust_PMCCLIP(TrainerX):
 
         names = self.get_model_names()
         model_file = "model-best.pth.tar"
-
         if epoch is not None:
             model_file = "model.pth.tar-" + str(epoch)
 
         for name in names:
             model_path = osp.join(directory, name, model_file)
-
             if not osp.exists(model_path):
-                raise FileNotFoundError('Model not found at "{}"'.format(model_path))
+                print(f"No pretrained model found at '{model_path}', training from scratch")
+                return
 
             checkpoint = load_checkpoint(model_path)
             state_dict = checkpoint["state_dict"]
             epoch = checkpoint["epoch"]
+
+            if "prompt_learner.token_prefix" in state_dict:
+                del state_dict["prompt_learner.token_prefix"]
+            if "prompt_learner.token_suffix" in state_dict:
+                del state_dict["prompt_learner.token_suffix"]
 
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             self._models[name].load_state_dict(state_dict, strict=False)

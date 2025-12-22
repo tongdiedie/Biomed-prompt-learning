@@ -3,15 +3,8 @@ BiomedDPT_Robust (CLIP backbone)
 ================================
 BiomedDPT + 低质量 Prompt 鲁棒性增强
 
-核心改进:
-在 L1 损失中添加低质量 Prompt 约束，让模型同时学习：
-1. 细粒度语义（从高质量 Prompt）
-2. 核心语义（从低质量 Prompt）
-
-损失函数:
-L = L_ce + λ1 * L_L1_high + λ2 * L_KL + λ3 * L_L1_low
-
-文件位置：trainers/BiomedDPT_Robust/biomeddpt_robust_clip.py
+核心改进：在原有 BiomedDPT_CLIP 基础上添加低质量 Prompt 约束
+损失函数：L = L_ce + λ1 * L_L1_high + λ2 * L_KL + λ3 * L_L1_low
 """
 
 import copy
@@ -26,13 +19,9 @@ from dassl.engine import TRAINER_REGISTRY, TrainerX
 from dassl.utils import load_pretrained_weights, load_checkpoint
 from dassl.optim import build_optimizer, build_lr_scheduler
 from dassl.metrics import compute_accuracy
-
-# 导入 Prompt 模板
-from trainers.prompt_templates import (
-    BIOMEDDPT_TEMPLATES,        # 高质量 GPT-4 Prompt
-    CUSTOM_BIOMEDDPT_TEMPLATES, # 中等质量模板
-    ZERO_SHOT_TEMPLATES         # 【新增】低质量 Prompt
-)
+from trainers.prompt_templates import BIOMEDDPT_TEMPLATES
+from trainers.prompt_templates import CUSTOM_BIOMEDDPT_TEMPLATES
+from trainers.prompt_templates import ZERO_SHOT_TEMPLATES  # 【新增】导入低质量模板
 
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
@@ -77,14 +66,7 @@ class TextEncoder(nn.Module):
 
 
 class PromptLearner(nn.Module):
-    """
-    鲁棒性增强的 Prompt 学习器
-    
-    包含:
-    1. 高质量 Prompt（教师，冻结）：GPT-4 生成
-    2. 低质量 Prompt（参考锚点，冻结）：类别名
-    3. 可学习 Prompt（学生）：需同时向高质量和低质量对齐
-    """
+    """Prompt 学习器（在原版基础上添加低质量 Prompt 约束）"""
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         n_cls = len(classnames)
@@ -96,7 +78,7 @@ class PromptLearner(nn.Module):
         cfg_imsize = cfg.INPUT.SIZE[0]
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
-        # ========== 1. 初始化可学习 Prompt（学生）==========
+        # 初始化可学习上下文向量 
         if ctx_init and n_ctx <= 4:
             ctx_init = ctx_init.replace("_", " ")
             n_ctx = n_ctx
@@ -110,70 +92,59 @@ class PromptLearner(nn.Module):
             nn.init.normal_(ctx_vectors, std=0.02)
             prompt_prefix = " ".join(["X"] * n_ctx)
         
-        print(f'[INIT] Learnable Prompt: \"{prompt_prefix}\"')
-        print(f"上下文长度: {n_ctx}")
+        print(f'Initial text context: "{prompt_prefix}"')
+        print(f"Number of context words (tokens) for Language prompting: {n_ctx}")
         self.ctx = nn.Parameter(ctx_vectors)
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
-        
-        # 使用中等质量模板构造可学习 Prompt
         temp = CUSTOM_BIOMEDDPT_TEMPLATES[cfg.DATASET.NAME]
         prompts = [temp.format(c.replace("_", " ")) for c in classnames]
 
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
-        
-        # ========== 2. 加载高质量 Prompt（教师，冻结）==========
-        print("[TEACHER] Loading high-quality Prompt (GPT-4 generated, frozen)")
         clip_model_temp = load_clip_to_cpu(cfg).float().cuda()
+        clip_model_temp_image = load_clip_to_cpu(cfg).float().cuda()
+        
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+            self.ZS_image_encoder = clip_model_temp_image.visual
             
-            # 预计算高质量 Prompt 的特征
+            # 预计算高质量特征 
             all_teacher_features = []
             for i in range(cfg.TRAINER.BIOMEDDPT_ROBUST.N_PROMPTS):
-                x_tokenized = torch.cat([
-                    clip.tokenize(BIOMEDDPT_TEMPLATES[classname][i]) 
-                    for classname in classnames
-                ])
+                x_tokenized = torch.cat([clip.tokenize(BIOMEDDPT_TEMPLATES[classname][i]) for classname in classnames])
                 text_features = clip_model_temp.encode_text(x_tokenized.cuda())
                 all_teacher_features.append(text_features.unsqueeze(1))
 
-        self.fixed_embeddings = torch.cat(all_teacher_features, dim=1)  # 高质量特征
-        print(f"[OK] High-quality Prompts: {cfg.TRAINER.BIOMEDDPT_ROBUST.N_PROMPTS} per class")
+        self.fixed_embeddings = torch.cat(all_teacher_features, dim=1)
         
-        # ========== 3. 【关键新增】初始化低质量 Prompt（鲁棒性锚点，冻结）==========
-        print("[ANCHOR] Loading low-quality Prompt (robustness anchor, frozen)")
+        # ========== 【关键新增】预计算低质量特征 ==========
+        print("[ANCHOR] Loading low-quality Prompt (robustness anchor)")
         low_template_type = cfg.TRAINER.BIOMEDDPT_ROBUST.LOW_TEMPLATE_TYPE
-        
         if low_template_type not in ZERO_SHOT_TEMPLATES:
-            print(f"警告: 未知模板类型 '{low_template_type}'，使用 'minimal'")
+            print(f"Warning: Unknown template type '{low_template_type}', using 'minimal'")
             low_template_type = "minimal"
-        
         template = ZERO_SHOT_TEMPLATES[low_template_type]
-        print(f"低质量模板类型: {low_template_type}")
+        print(f"Low-quality template type: {low_template_type}")
         
-        # 生成低质量 Prompt
         if template == "":
-            low_quality_prompts = ["" for _ in classnames]
-            print("使用空字符串作为低质量 Prompt")
+            low_quality_prompts = ["X" for _ in classnames]
+            print("Using 'X' as low-quality prompt")
         else:
             low_quality_prompts = [template.format(**{"class": cls}) for cls in classnames]
-            print(f"生成的低质量 Prompt 示例:")
+            print(f"Low-quality prompt examples (first 3):")
             for cls, prompt in zip(classnames[:3], low_quality_prompts[:3]):
                 print(f"  {cls:15} -> '{prompt}'")
         
-        # 预计算低质量 Prompt 的特征
         with torch.no_grad():
             low_tokenized = torch.cat([clip.tokenize(p if p else "X") for p in low_quality_prompts])
             low_text_features = clip_model_temp.encode_text(low_tokenized.cuda())
         
-        self.fixed_low_embeddings = low_text_features  # 低质量特征（冻结）
-        print(f"[OK] Low-quality Prompt initialized")
-        
-        # 保存 token 嵌入
-        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
+        self.fixed_low_embeddings = low_text_features
+        print(f"[OK] Low-quality Prompt initialized\n")
+
+        self.register_buffer("token_prefix", embedding[:, :1, :])
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])
 
         self.n_cls = n_cls
         self.n_ctx = n_ctx
@@ -181,21 +152,13 @@ class PromptLearner(nn.Module):
         self.name_lens = name_lens
 
     def construct_prompts(self, ctx, prefix, suffix, label=None):
-        """构造完整的 Prompt"""
         if label is not None:
             prefix = prefix[label]
             suffix = suffix[label]
-
         prompts = torch.cat([prefix, ctx, suffix], dim=1)
         return prompts
 
     def forward(self):
-        """
-        返回可学习 Prompt 的嵌入
-        
-        返回:
-            prompts: 可学习 Prompt 嵌入
-        """
         ctx = self.ctx
         if ctx.dim() == 2:
             ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
@@ -203,12 +166,11 @@ class PromptLearner(nn.Module):
         prefix = self.token_prefix
         suffix = self.token_suffix
         prompts = self.construct_prompts(ctx, prefix, suffix)
-
         return prompts
 
 
 class CLIP_Inplanted(nn.Module):
-    """带 Visual Prompt 的图像编码器"""
+    """带 Visual Prompt 的图像编码器 """
     def __init__(self, clip_model):
         super().__init__()
         self.clipmodel = clip_model
@@ -224,27 +186,16 @@ class CLIP_Inplanted(nn.Module):
         x = self.image_encoder.conv1(x)
         x = x.reshape(x.shape[0], x.shape[1], -1) 
         x = x.permute(0, 2, 1) 
-        x = torch.cat([
-            self.image_encoder.class_embedding.to(x.dtype) + 
-            torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x
-        ], dim=1)
+        x = torch.cat([self.image_encoder.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
         x = x + self.image_encoder.positional_embedding.to(x.dtype)
         x = self.image_encoder.ln_pre(x)
         
         B = x.shape[0]
-        x = torch.cat((
-            x[:, :1, :],
-            self.prompt_dropout(self.prompt_embeddings.expand(B, -1, -1)),
-            x[:, 1+self.num_tokens:, :]
-        ), dim=1)
+        x = torch.cat((x[:, :1, :], self.prompt_dropout(self.prompt_embeddings.expand(B, -1, -1)), x[:, 1+self.num_tokens:, :]), dim=1)
         
         for i in range(12):
             B = x.shape[0]
-            x = torch.cat((
-                x[:, :1, :],
-                self.prompt_dropout(self.deep_prompt_embeddings[i].expand(B, -1, -1)),
-                x[:, 1+self.num_tokens:, :]
-            ), dim=1)
+            x = torch.cat((x[:, :1, :], self.prompt_dropout(self.deep_prompt_embeddings[i].expand(B, -1, -1)), x[:, 1+self.num_tokens:, :]), dim=1)
             x = x.permute(1, 0, 2)
             x = self.image_encoder.transformer.resblocks[i](x)
             x = x.permute(1, 0, 2)
@@ -256,7 +207,7 @@ class CLIP_Inplanted(nn.Module):
 
 
 class CustomCLIP(nn.Module):
-    """鲁棒性增强的 CLIP 模型"""
+    """自定义 CLIP（在原版基础上添加低质量 Prompt 损失）"""
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
@@ -270,73 +221,37 @@ class CustomCLIP(nn.Module):
         self.cfg = cfg
 
     def forward(self, image, label=None):
-        """
-        前向传播
-        
-        计算损失:
-        L = L_ce + λ1 * L_L1_high + λ2 * L_KL + λ3 * L_L1_low
-        """
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
 
-        # 获取可学习 Prompt
         prompts = self.prompt_learner()
-
-        # 提取特征
         text_features = self.text_encoder(prompts, tokenized_prompts)
         image_features = self.image_encoder(image.type(self.dtype))
         
-        # 归一化
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         
-        # 高质量特征（教师）
         fixed_embeddings = self.prompt_learner.fixed_embeddings
         fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
         fixed_embeddings = fixed_embeddings.mean(dim=1)
         fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
         
-        # 【关键新增】低质量特征（鲁棒性锚点）
+        # 【关键新增】低质量特征
         fixed_low_embeddings = self.prompt_learner.fixed_low_embeddings
         fixed_low_embeddings = fixed_low_embeddings / fixed_low_embeddings.norm(dim=-1, keepdim=True)
         
-        # 计算 logits
         zero_shot_logits = logit_scale * image_features @ fixed_embeddings.cuda().t()
         logits = logit_scale * image_features @ text_features.t()
         
         if self.prompt_learner.training:
-            # ========== 损失 1：交叉熵损失 ==========
             loss_ce = F.cross_entropy(logits, label)
+            loss_l1 = F.l1_loss(text_features, fixed_embeddings.cuda(), reduction='mean') * self.cfg.TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_HIGH
+            loss_kl = F.kl_div(F.log_softmax(logits, dim=1), F.log_softmax(zero_shot_logits, dim=1), reduction='sum', log_target=True) / logits.numel() * self.cfg.TRAINER.BIOMEDDPT_ROBUST.KL_LAMBDA
             
-            # ========== 损失 2：L1 对齐损失（可学习 → 高质量）==========
-            loss_l1_high = F.l1_loss(
-                text_features, 
-                fixed_embeddings.cuda(), 
-                reduction='mean'
-            ) * self.cfg.TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_HIGH
+            # 【关键新增】低质量 Prompt 约束
+            loss_l1_low = F.l1_loss(text_features, fixed_low_embeddings.cuda(), reduction='mean') * self.cfg.TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_LOW
             
-            # ========== 损失 3：KL 散度损失（知识蒸馏）==========
-            loss_kl = F.kl_div(
-                F.log_softmax(logits, dim=1),
-                F.log_softmax(zero_shot_logits, dim=1),
-                reduction='sum',
-                log_target=True
-            ) / logits.numel() * self.cfg.TRAINER.BIOMEDDPT_ROBUST.KL_LAMBDA
-            
-            # ========== 【关键新增】损失 4：L1 鲁棒性约束（可学习 → 低质量）==========
-            """
-            让可学习 Prompt 不仅向高质量对齐（学习细粒度语义），
-            还要向低质量对齐（提取核心语义，去除冗余）
-            """
-            loss_l1_low = F.l1_loss(
-                text_features, 
-                fixed_low_embeddings.cuda(), 
-                reduction='mean'
-            ) * self.cfg.TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_LOW
-            
-            # ========== 总损失 ==========
-            total_loss = loss_ce + loss_l1_high + loss_kl + loss_l1_low
-            
+            total_loss = loss_ce + loss_l1 + loss_kl + loss_l1_low
             return logits, total_loss
         else:
             return logits
@@ -344,8 +259,7 @@ class CustomCLIP(nn.Module):
 
 @TRAINER_REGISTRY.register()
 class BiomedDPT_Robust_CLIP(TrainerX):
-    """BiomedDPT_Robust 训练器（CLIP backbone）"""
-    
+    """训练器（与 biomeddpt_clip.py 完全相同）"""
     def check_cfg(self, cfg):
         assert cfg.TRAINER.BIOMEDDPT_ROBUST.PREC in ["fp16", "fp32", "amp"]
 
@@ -353,33 +267,28 @@ class BiomedDPT_Robust_CLIP(TrainerX):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
 
-        print(f"\n{'='*80}")
-        print(f"🚀 构建 BiomedDPT_Robust 模型（CLIP backbone）")
-        print(f"{'='*80}\n")
-        
-        print(f"加载 CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
+        print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
 
         if cfg.TRAINER.BIOMEDDPT_ROBUST.PREC == "fp32" or cfg.TRAINER.BIOMEDDPT_ROBUST.PREC == "amp":
             clip_model.float()
 
-        print("构建自定义 CLIP 模型")
+        print("Building custom CLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model.eval())
 
-        print("冻结图像和文本编码器，仅优化 Prompt")
+        print("Turning off gradients in both the image and the text encoder")
         names_to_update = ["prompt_learner.ctx"]
 
         for name, param in self.model.named_parameters():
             if name not in names_to_update:
                 param.requires_grad_(False)
 
-        # 检查可训练参数
         enabled = set()
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 enabled.add(name)
-        print(f"\n[OK] Trainable parameters: {enabled}")
-        print(f"✅ 参数数量: {len(enabled)}\n")
+        print(f"Parameters to be updated: {enabled}")
+        print(f"Parameters count: {len(enabled)}")
         
         if cfg.MODEL.INIT_WEIGHTS:
             load_pretrained_weights(self.model, cfg.MODEL.INIT_WEIGHTS)
@@ -395,14 +304,11 @@ class BiomedDPT_Robust_CLIP(TrainerX):
         
         device_count = torch.cuda.device_count()
         if device_count > 1:
-            print(f"检测到多 GPU ({device_count} 个)，使用全部！")
+            print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
             self.model = nn.DataParallel(self.model)
-        
-        print(f"{'='*80}\n")
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
-
         model = self.model
         optim = self.optim
         scaler = self.scaler
@@ -419,14 +325,9 @@ class BiomedDPT_Robust_CLIP(TrainerX):
             logits, loss = model(image, label)
             self.model_backward_and_update(loss)
 
-        loss_summary = {
-            "loss": loss.item(),
-            "acc": compute_accuracy(logits, label)[0].item(),
-        }
-
+        loss_summary = {"loss": loss.item(), "acc": compute_accuracy(logits, label)[0].item()}
         if (self.batch_idx + 1) == self.num_batches:
             self.update_lr()
-
         return loss_summary
 
     def parse_batch_train(self, batch):
@@ -443,24 +344,21 @@ class BiomedDPT_Robust_CLIP(TrainerX):
 
         names = self.get_model_names()
         model_file = "model-best.pth.tar"
-
         if epoch is not None:
             model_file = "model.pth.tar-" + str(epoch)
 
         for name in names:
             model_path = osp.join(directory, name, model_file)
-
             if not osp.exists(model_path):
-                raise FileNotFoundError('Model not found at "{}"'.format(model_path))
+                print(f"No pretrained model found at '{model_path}', training from scratch")
+                return
 
             checkpoint = load_checkpoint(model_path)
             state_dict = checkpoint["state_dict"]
             epoch = checkpoint["epoch"]
 
-            # Ignore fixed token vectors
             if "prompt_learner.token_prefix" in state_dict:
                 del state_dict["prompt_learner.token_prefix"]
-
             if "prompt_learner.token_suffix" in state_dict:
                 del state_dict["prompt_learner.token_suffix"]
 
