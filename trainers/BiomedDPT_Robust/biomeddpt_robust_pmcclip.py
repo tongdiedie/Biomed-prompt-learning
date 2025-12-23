@@ -7,6 +7,15 @@ BiomedDPT + 低质量 Prompt 鲁棒性增强（PMC-CLIP 版本）
 损失函数：L = L_ce + λ1 * L_L1_high + λ2 * L_KL + λ3 * L_L1_low
 """
 
+# 【关键修复】禁用可能导致 sm80 错误的优化
+import os
+os.environ["TORCH_CUDNN_SDPA_ENABLED"] = "0"
+
+import torch
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
+
 import copy
 import os
 import os.path as osp
