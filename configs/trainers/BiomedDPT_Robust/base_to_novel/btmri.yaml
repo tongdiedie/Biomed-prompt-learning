@@ -30,18 +30,15 @@ MODEL:
 
 TRAINER:
   BIOMEDDPT_ROBUST:
-    # Prompt 设置
+    
     CTX_INIT: "a MR photo of a"
     N_CTX: 5
-    
-    # GPT-4 高质量 Prompt 数量
+       
     N_PROMPTS: 50
     
-    # 损失权重（保持原 BiomedDPT 的值）
-    L1_LAMBDA_HIGH: 25.0      # 原 L1_LAMBDA
-    KL_LAMBDA: 0.5            # 原 KL_LAMBDA
+    L1_LAMBDA_HIGH: 25.0      
+    KL_LAMBDA: 0.5            
     
-    # 【关键新增】低质量 Prompt 约束
-    L1_LAMBDA_LOW: 0.3        # 向低质量对齐的权重
-    LOW_TEMPLATE_TYPE: "minimal"  # 低质量模板类型: minimal, article, generic, medical_minimal, empty
+    L1_LAMBDA_LOW: 0.3        
+    LOW_TEMPLATE_TYPE: "minimal"  # minimal/article/generic/medical_minimal/empty
     
