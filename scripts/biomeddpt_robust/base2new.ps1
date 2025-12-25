@@ -3,7 +3,7 @@
     BiomedDPT_Robust Base-to-New Training and Evaluation Script
 .DESCRIPTION
     Usage: .\base2new.ps1 <DATA_PATH> <DATASET> <MODEL>
-    Example: .\base2new.ps1 data BTMRI BiomedCLIP
+    Example: .\base2new.ps1 data btmri BiomedCLIP
 #>
 
 param(
