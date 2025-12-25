@@ -14,9 +14,9 @@ CTP=end
 
 # 【新增】Robust 参数配置
 LOW_TEMPLATE_TYPE=minimal  # 低质量模板类型: minimal, class_only, empty
-L1_LAMBDA_HIGH=0.5         # 高质量 L1 损失权重
-L1_LAMBDA_LOW=0.3          # 低质量 L1 损失权重
-KL_LAMBDA=0.1              # KL 散度损失权重
+# L1_LAMBDA_HIGH=0.5         
+# L1_LAMBDA_LOW=0.3          
+# KL_LAMBDA=0.1              
 
 METHOD=BiomedDPT_Robust
 TRAINER=BiomedDPT_Robust_${MODEL}
@@ -38,9 +38,9 @@ do
             TRAINER.BIOMEDDPT_ROBUST.CSC ${CSC} \
             TRAINER.BIOMEDDPT_ROBUST.CLASS_TOKEN_POSITION ${CTP} \
             TRAINER.BIOMEDDPT_ROBUST.LOW_TEMPLATE_TYPE ${LOW_TEMPLATE_TYPE} \
-            TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_HIGH ${L1_LAMBDA_HIGH} \
-            TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_LOW ${L1_LAMBDA_LOW} \
-            TRAINER.BIOMEDDPT_ROBUST.KL_LAMBDA ${KL_LAMBDA} \
+            # TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_HIGH ${L1_LAMBDA_HIGH} \
+            # TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_LOW ${L1_LAMBDA_LOW} \
+            # TRAINER.BIOMEDDPT_ROBUST.KL_LAMBDA ${KL_LAMBDA} \
             DATASET.NUM_SHOTS ${SHOTS}
     fi
 done

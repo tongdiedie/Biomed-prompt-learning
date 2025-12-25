@@ -27,9 +27,9 @@ $TRAINER = "BiomedDPT_Robust_$MODEL"
 
 # Robust 参数配置
 $LOW_TEMPLATE_TYPE = "minimal"
-$L1_LAMBDA_HIGH = 0.5
-$L1_LAMBDA_LOW = 0.3
-$KL_LAMBDA = 0.1
+# $L1_LAMBDA_HIGH = 0.5
+# $L1_LAMBDA_LOW = 0.3
+# $KL_LAMBDA = 0.1
 
 # 评估 3 个不同的随机种子
 foreach ($SEED in 1..3) {
@@ -66,9 +66,10 @@ foreach ($SEED in 1..3) {
                 --eval-only `
                 DATASET.SUBSAMPLE_CLASSES $SUB_TASK `
                 TRAINER.BIOMEDDPT_ROBUST.LOW_TEMPLATE_TYPE $LOW_TEMPLATE_TYPE `
-                TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_HIGH $L1_LAMBDA_HIGH `
-                TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_LOW $L1_LAMBDA_LOW `
-                TRAINER.BIOMEDDPT_ROBUST.KL_LAMBDA $KL_LAMBDA
+                # TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_HIGH $L1_LAMBDA_HIGH `
+                # TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_LOW $L1_LAMBDA_LOW `
+                # TRAINER.BIOMEDDPT_ROBUST.KL_LAMBDA $KL_LAMBDA
+
         }
     }
 }
