@@ -29,16 +29,14 @@ MODEL:
     NAME: "ViT-B/16"
 
 TRAINER:
-  BIOMED_CONTRAST:
-
+  BIOMEDDPT:
     CTX_INIT: "a endoscopic photo of a"
     L1_LAMBDA: 10.0
     KL_LAMBDA: 0.5
     N_PROMPTS: 50
     N_CTX: 5
     
-    CONTRAST_LAMBDA: 0.5
-    TEMPERATURE: 0.07
-    CSC: False
+    REPULSION_LAMBDA: 0.09  
+    MARGIN: 0.27
     CLASS_TOKEN_POSITION: "end"
-    PREC: "fp16"
+    PREC: "fp32"

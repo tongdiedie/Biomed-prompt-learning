@@ -27,7 +27,7 @@ $CSC = "False"
 $CTP = "end"
 
 # 【新增】Robust 参数配置
-$LOW_TEMPLATE_TYPE = "minimal"  # 低质量模板类型: minimal, class_only, empty
+$LOW_TEMPLATE_TYPE = "empty"  # 低质量模板类型: minimal, class_only, empty
 # $L1_LAMBDA_HIGH = 0.5
 # $L1_LAMBDA_LOW = 0.3
 # $KL_LAMBDA = 0.1 

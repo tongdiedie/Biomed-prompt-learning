@@ -36,8 +36,8 @@ TRAINER:
     N_PROMPTS: 50
     N_CTX: 4
 
-    CONTRAST_LAMBDA: 0.5
-    TEMPERATURE: 0.07
-    CSC: False
+    REPULSION_LAMBDA: 0.11
+    MARGIN: 0.29
     CLASS_TOKEN_POSITION: "end"
-    PREC: "fp16"
+    PREC: "fp32"
+    CSC: False

@@ -16,11 +16,7 @@ from trainers.prompt_templates import CUSTOM_BIOMEDDPT_TEMPLATES
 
 from open_clip.src.open_clip import create_model_from_pretrained, get_tokenizer
 
-
 class TextEncoder(nn.Module):
-    """
-    文本编码器 - 使用BiomedCLIP的text encoder来编码prompt
-    """
     def __init__(self, biomedclip_model):
         super().__init__()
         self.model = biomedclip_model
@@ -30,34 +26,22 @@ class TextEncoder(nn.Module):
         x = self.model.encode_text(prompts, True, tokenized_prompts)
         return x
 
-
 class PromptLearner(nn.Module):
-    """
-    可学习的prompt模块
-    - 为每个类别学习context vectors
-    - 结合BIOMEDDPT_TEMPLATES中的多个描述性prompts
-    """
     def __init__(self, cfg, classnames, biomedclip_model):
         super().__init__()
         n_cls = len(classnames)
-        n_ctx = cfg.TRAINER.BIOMED_CONTRAST.N_CTX
-        ctx_init = cfg.TRAINER.BIOMED_CONTRAST.CTX_INIT
+        n_ctx = cfg.TRAINER.BIOMEDDPT.N_CTX
+        ctx_init = cfg.TRAINER.BIOMEDDPT.CTX_INIT
         dtype = biomedclip_model.text.transformer.dtype
         ctx_dim = 768
         clip_imsize = 224
         cfg_imsize = cfg.INPUT.SIZE[0]
-        
-        # 初始化tokenizer
-        self.tokenizer = get_tokenizer(
-            'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
-            cache_dir='clip/checkpoints/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
-        )
-        
+        self.tokenizer = get_tokenizer('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224', 
+                                       cache_dir='clip/checkpoints/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
-        # 初始化context vectors（可学习的prompt部分）
         if ctx_init:
-            # 使用给定的单词来初始化context vectors
+            # 使用给定的词来初始化上下文向量
             ctx_init = ctx_init.replace("_", " ")
             prompt = self.tokenizer(ctx_init)
             with torch.no_grad():
@@ -66,7 +50,7 @@ class PromptLearner(nn.Module):
             prompt_prefix = ctx_init
         else:
             # 随机初始化
-            if cfg.TRAINER.BIOMED_CONTRAST.CSC:
+            if cfg.TRAINER.BIOMEDDPT.CSC:
                 print("Initializing class-specific contexts")
                 ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
             else:
@@ -74,64 +58,93 @@ class PromptLearner(nn.Module):
                 ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
             nn.init.normal_(ctx_vectors, std=0.02)
             prompt_prefix = " ".join(["X"] * n_ctx)
-            
+        
         print(f'Initial text context: "{prompt_prefix}"')
         print(f"Number of context words (tokens) for Language prompting: {n_ctx}")
-        
-        # 可学习的context参数
         self.ctx = nn.Parameter(ctx_vectors)
 
-        # 处理类别名称
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(self.tokenizer(name)) for name in classnames]
-        
-        # 使用自定义模板格式化prompts
         temp = CUSTOM_BIOMEDDPT_TEMPLATES[cfg.DATASET.NAME]
         prompts = [temp.format(c.replace("_", " ")) for c in classnames]
 
-        # Tokenize prompts
         tokenized_prompts = torch.cat([self.tokenizer(p) for p in prompts])
         
-        # 创建frozen CLIP用于生成对比学习的目标特征
+        # 创建冻结的CLIP模型用于提取固定特征
         biomedclip_model_temp, _ = create_model_from_pretrained(
-            'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
-            cache_dir='clip/checkpoints/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
-        )
+            'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224', 
+            cache_dir='clip/checkpoints/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
         biomedclip_model_temp = biomedclip_model_temp.float().eval().cuda()
         
-        # 预计算frozen embeddings（用于知识蒸馏）
         with torch.no_grad():
             embedding = biomedclip_model.text.transformer.embeddings.word_embeddings(tokenized_prompts).type(dtype)
             
-            # 为每个类别生成多个template的特征（用于对比学习）
+            # ===== 1. 预计算正样本特征（原有逻辑）=====
             all_teacher_features = []
-            num_temp = cfg.TRAINER.BIOMED_CONTRAST.N_PROMPTS
-            
+            num_temp = cfg.TRAINER.BIOMEDDPT.N_PROMPTS
             for i in range(num_temp):
-                x_tokenized = torch.cat([
-                    self.tokenizer(BIOMEDDPT_TEMPLATES[classname][i]) 
-                    for classname in classnames
-                ])
+                x_tokenized = torch.cat([self.tokenizer(BIOMEDDPT_TEMPLATES[classname][i]) for classname in classnames])
                 text_features = biomedclip_model_temp.encode_text(x_tokenized.cuda())
                 all_teacher_features.append(text_features.unsqueeze(1))
+            
+            # ===== 2. 新增：通过替换类别名称生成负样本特征 =====
+            print("Generating negative samples by replacing class names in prompts...")
+            all_negative_features = []
+            
+            # 对于每个目标类别
+            for target_idx in range(n_cls):
+                target_class = classnames[target_idx]  # 当前目标类别名
+                negative_features_per_class = []
+                
+                # 遍历所有其他类别作为替换源
+                for neg_idx in range(n_cls):
+                    if neg_idx == target_idx:  # 跳过自己
+                        continue
+                    
+                    neg_class = classnames[neg_idx]  # 负样本类别名
+                    
+                    # 关键：用负类别名替换目标类的描述
+                    # 例如: "A normal brain in MRI..." -> "A glioma tumor in MRI..."
+                    # 使用BIOMEDDPT_TEMPLATES的多个模板
+                    replaced_prompts = []
+                    for template_idx in range(num_temp):
+                        # 获取目标类的原始模板描述
+                        original_prompt = BIOMEDDPT_TEMPLATES[target_class][template_idx]
+                        # 将其中的类别名替换为负类别名
+                        # 方法：简单的字符串替换
+                        replaced_prompt = original_prompt.replace(target_class, neg_class)
+                        replaced_prompts.append(replaced_prompt)
+                    
+                    # 对替换后的prompts进行编码
+                    replaced_tokenized = torch.cat([self.tokenizer(p) for p in replaced_prompts])
+                    replaced_features = biomedclip_model_temp.encode_text(replaced_tokenized.cuda())
+                    
+                    # 对同一个负类的多个模板取平均
+                    replaced_features = replaced_features.mean(dim=0, keepdim=True)
+                    negative_features_per_class.append(replaced_features)
+                
+                # 堆叠该类的所有负样本特征 (n_cls-1, dim)
+                negative_features_per_class = torch.cat(negative_features_per_class, dim=0)
+                all_negative_features.append(negative_features_per_class.unsqueeze(0))
+            
+            # all_negative_features shape: (n_cls, n_cls-1, dim)
+            self.fixed_negative_embeddings = torch.cat(all_negative_features, dim=0)
+            print(f"✓ Generated negative embeddings with shape: {self.fixed_negative_embeddings.shape}")
+            print(f"  Strategy: Replaced class names in original templates")
+            print(f"  Example: '{classnames[0]}' -> '{classnames[1]}' in {classnames[0]}'s description")
 
-        # 存储frozen embeddings - shape: (n_cls, n_prompts, dim)
+        # 正样本特征 shape: (n_cls, num_temp, dim)
         self.fixed_embeddings = torch.cat(all_teacher_features, dim=1)
-        
-        # 注册不可学习的buffers
-        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS token
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS tokens
+        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
 
         self.n_cls = n_cls
         self.n_ctx = n_ctx
         self.tokenized_prompts = tokenized_prompts
         self.name_lens = name_lens
-        self.class_token_position = cfg.TRAINER.BIOMED_CONTRAST.CLASS_TOKEN_POSITION
+        self.class_token_position = cfg.TRAINER.BIOMEDDPT.CLASS_TOKEN_POSITION
 
     def forward(self):
-        """
-        构造完整的prompts（prefix + learnable context + suffix）
-        """
         ctx = self.ctx
         if ctx.dim() == 2:
             ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
@@ -140,11 +153,16 @@ class PromptLearner(nn.Module):
         suffix = self.token_suffix
 
         if self.class_token_position == "end":
-            # 格式: [SOS] + [CTX] + [CLASS] + [EOS]
-            prompts = torch.cat([prefix, ctx, suffix], dim=1)
+            prompts = torch.cat(
+                [
+                    prefix,  # (n_cls, 1, dim)
+                    ctx,     # (n_cls, n_ctx, dim)
+                    suffix,  # (n_cls, *, dim)
+                ],
+                dim=1,
+            )
 
         elif self.class_token_position == "middle":
-            # 格式: [SOS] + [CTX_HALF1] + [CLASS] + [CTX_HALF2] + [EOS]
             half_n_ctx = self.n_ctx // 2
             prompts = []
             for i in range(self.n_cls):
@@ -154,12 +172,20 @@ class PromptLearner(nn.Module):
                 suffix_i = suffix[i : i + 1, name_len:, :]
                 ctx_i_half1 = ctx[i : i + 1, :half_n_ctx, :]
                 ctx_i_half2 = ctx[i : i + 1, half_n_ctx:, :]
-                prompt = torch.cat([prefix_i, ctx_i_half1, class_i, ctx_i_half2, suffix_i], dim=1)
+                prompt = torch.cat(
+                    [
+                        prefix_i,     # (1, 1, dim)
+                        ctx_i_half1,  # (1, n_ctx//2, dim)
+                        class_i,      # (1, name_len, dim)
+                        ctx_i_half2,  # (1, n_ctx//2, dim)
+                        suffix_i,     # (1, *, dim)
+                    ],
+                    dim=1,
+                )
                 prompts.append(prompt)
             prompts = torch.cat(prompts, dim=0)
 
         elif self.class_token_position == "front":
-            # 格式: [SOS] + [CLASS] + [CTX] + [EOS]
             prompts = []
             for i in range(self.n_cls):
                 name_len = self.name_lens[i]
@@ -167,7 +193,15 @@ class PromptLearner(nn.Module):
                 class_i = suffix[i : i + 1, :name_len, :]
                 suffix_i = suffix[i : i + 1, name_len:, :]
                 ctx_i = ctx[i : i + 1, :, :]
-                prompt = torch.cat([prefix_i, class_i, ctx_i, suffix_i], dim=1)
+                prompt = torch.cat(
+                    [
+                        prefix_i,  # (1, 1, dim)
+                        class_i,   # (1, name_len, dim)
+                        ctx_i,     # (1, n_ctx, dim)
+                        suffix_i,  # (1, *, dim)
+                    ],
+                    dim=1,
+                )
                 prompts.append(prompt)
             prompts = torch.cat(prompts, dim=0)
 
@@ -175,79 +209,48 @@ class PromptLearner(nn.Module):
             raise ValueError
 
         return prompts
-
-
+    
 class CLIP_Inplanted(nn.Module):
-    """
-    图像编码器 - 在BiomedCLIP的visual encoder中添加可学习的visual prompts
-    这些prompts会被插入到transformer的每一层中
-    """
     def __init__(self, clip_model):
         super().__init__()
         self.clipmodel = clip_model
         self.image_encoder = clip_model.visual
         self.dtype = clip_model.text.transformer.dtype
-        
-        # Visual prompt参数
-        self.num_tokens = 4  # 每层添加4个prompt tokens
-        self.prompt_dim = 768  # prompt维度
-        
-        # 浅层prompt（patch embedding之后）
+        self.num_tokens = 4
+        self.prompt_dim = 768
         self.prompt_embeddings = torch.zeros(1, self.num_tokens, self.prompt_dim)
-        
-        # 深层prompts（每个transformer block）
         self.deep_prompt_embeddings = torch.zeros(12, self.num_tokens, self.prompt_dim)
-        
-        # Dropout防止过拟合
         self.prompt_dropout = nn.Dropout(0.5)
 
     def forward(self, x):
-        """
-        在每个transformer layer前插入visual prompts
-        """
-        # Patch embedding
         x = self.image_encoder.trunk.patch_embed(x)
         x = self.image_encoder.trunk._pos_embed(x)
         x = self.image_encoder.trunk.patch_drop(x)
         x = self.image_encoder.trunk.norm_pre(x)
-        
         B = x.shape[0]
-        
-        # 在CLS token后插入shallow prompts
         x = torch.cat((
-            x[:, :1, :],  # CLS token
-            self.prompt_dropout(self.prompt_embeddings.expand(B, -1, -1).cuda()),  # Prompt tokens
-            x[:, 1+self.num_tokens:, :]  # 其余的patch tokens
-        ), dim=1)
-        
-        # 通过12个transformer blocks，每层都添加deep prompts
+            x[:, :1, :],
+            self.prompt_dropout(self.prompt_embeddings.expand(B, -1, -1).cuda()),
+            x[:, 1+self.num_tokens:, :]
+        ), dim=1)  
         for i in range(12):
             B = x.shape[0]
-            # 在每层前重新插入prompts
             x = torch.cat((
-                x[:, :1, :],  # CLS token
+                x[:, :1, :],
                 self.prompt_dropout(self.deep_prompt_embeddings[i].expand(B, -1, -1).cuda()),
-                x[:, 1+self.num_tokens:, :]  # 其余tokens
-            ), dim=1)
+                x[:, 1+self.num_tokens:, :]
+            ), dim=1)  
             x = self.image_encoder.trunk.blocks[i](x)
-        
-        # 最终的norm和projection
         x = self.image_encoder.trunk.norm(x)
-        x = x[:, 0]  # 只取CLS token
+        x = x[:, 0]
         x = self.image_encoder.trunk.fc_norm(x)
         x = self.image_encoder.trunk.head_drop(x)
         x = self.image_encoder.trunk.head(x)
         x = self.image_encoder.head(x)
-        
         return x
 
+
 class CustomCLIP(nn.Module):
-    """
-    自定义CLIP模型 - 结合了:
-    1. 可学习的text prompts
-    2. 可学习的visual prompts  
-    3. 对比学习loss（类别级别）
-    """
     def __init__(self, cfg, classnames, biomedclip_model):
         super().__init__()
         self.prompt_learner = PromptLearner(cfg, classnames, biomedclip_model)
@@ -260,161 +263,137 @@ class CustomCLIP(nn.Module):
         self.total_epochs = cfg.OPTIM.MAX_EPOCH
         self.n_cls = len(classnames)
 
-    def contrastive_loss(self, image_features, text_features, labels):
-        """
-        类别级对比学习loss
-        - 对于每个样本，同类的text embedding是正样本
-        - 其他类的text embedding是负样本
-        
-        Args:
-            image_features: (batch_size, dim) - 归一化的图像特征
-            text_features: (n_cls, dim) - 归一化的类别文本特征
-            labels: (batch_size,) - 样本的类别标签
-        
-        Returns:
-            contrastive_loss: 对比学习损失
-        """
-        batch_size = image_features.shape[0]
-        
-        # 计算图像特征和所有类别文本特征的相似度
-        # similarity: (batch_size, n_cls)
-        similarity = image_features @ text_features.t()
-        
-        # 创建positive mask: 同类为1，不同类为0
-        # labels: (batch_size,) -> (batch_size, 1) -> (batch_size, n_cls)
-        labels_expand = labels.unsqueeze(1)  # (batch_size, 1)
-        class_indices = torch.arange(self.n_cls).cuda().unsqueeze(0)  # (1, n_cls)
-        positive_mask = (labels_expand == class_indices).float()  # (batch_size, n_cls)
-        
-        # 对比学习: 最大化正样本相似度，最小化负样本相似度
-        # 使用InfoNCE loss的变体
-        # exp_sim: (batch_size, n_cls)
-        exp_sim = torch.exp(similarity / self.cfg.TRAINER.BIOMED_CONTRAST.TEMPERATURE)
-        
-        # 计算分母: 所有类别的exp similarity之和
-        # denominator: (batch_size,)
-        denominator = exp_sim.sum(dim=1)
-        
-        # 计算分子: 正类的exp similarity
-        # numerator: (batch_size,)
-        numerator = (exp_sim * positive_mask).sum(dim=1)
-        
-        # 对比损失: -log(正样本概率)
-        loss = -torch.log(numerator / (denominator + 1e-8))
-        
-        return loss.mean()
+        self.margin = cfg.TRAINER.BIOMEDDPT.MARGIN
+        self.repulsion_lambda = cfg.TRAINER.BIOMEDDPT.REPULSION_LAMBDA
 
     def forward(self, image, label=None):
-        """
-        前向传播 - 训练时返回logits和loss，测试时只返回logits
-        """
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
 
-        # 生成prompts
         prompts = self.prompt_learner()
 
-        # 编码文本和图像
+        # 计算prompted image和text特征
         text_features = self.text_encoder(prompts, tokenized_prompts)
         image_features = self.image_encoder(image.type(self.dtype))
         
-        # L2归一化
+        # 归一化特征
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         
-        # 获取固定的embeddings（用于蒸馏）
-        fixed_embeddings = self.prompt_learner.fixed_embeddings  # (n_cls, n_prompts, dim)
+        # 处理正样本固定embeddings
+        fixed_embeddings = self.prompt_learner.fixed_embeddings
+        fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
+        fixed_embeddings = fixed_embeddings.mean(dim=1)  # 对多个模板取平均
         fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
         
-        # 对多个prompts求平均
-        fixed_embeddings = fixed_embeddings.mean(dim=1)  # (n_cls, dim)
-        fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
-        
-        # 计算zero-shot logits（用于KL散度）
+        # 计算zero-shot logits
         zero_shot_logits = logit_scale * image_features @ fixed_embeddings.cuda().t()
         
-        # 计算learned logits
+        # 计算学习的logits
         logits = logit_scale * image_features @ text_features.t()
         
-        if self.prompt_learner.training:
-            # ========== 训练模式: 计算多个损失 ==========
-            
-            # 1. 交叉熵损失（分类loss）
+        if self.prompt_learner.training:         
+            # ===== Loss 1: 交叉熵损失（基础分类损失）=====
             loss_ce = F.cross_entropy(logits, label)
             
-            # 2. L1正则化损失（使学习的特征接近固定的特征）
-            loss_l1 = F.l1_loss(
-                text_features, 
-                fixed_embeddings.cuda(), 
-                reduction='mean'
-            ) * self.cfg.TRAINER.BIOMED_CONTRAST.L1_LAMBDA
+            # ===== Loss 2: L1损失（与正样本描述对齐）=====
+            loss_l1 = F.l1_loss(text_features, fixed_embeddings.cuda(), reduction='mean') * self.cfg.TRAINER.BIOMEDDPT.L1_LAMBDA 
             
-            # 3. KL散度损失（使learned logits接近zero-shot logits）
+            # ===== Loss 3: KL散度损失（与zero-shot预测对齐）=====
             loss_kl = F.kl_div(
                 F.log_softmax(logits, dim=1),
                 F.log_softmax(zero_shot_logits, dim=1),
                 reduction='sum',
                 log_target=True
-            ) / logits.numel() * self.cfg.TRAINER.BIOMED_CONTRAST.KL_LAMBDA
+            ) / logits.numel() * self.cfg.TRAINER.BIOMEDDPT.KL_LAMBDA
+
+            # ===== Loss 4: 负样本排斥损失（新增：远离替换后的错误描述）=====
+            # 核心思想：让学到的特征远离"用其他类名替换自己类名"的错误描述
+            # 例如：normal brain的特征应该远离"A glioma tumor in MRI appears with..."这种描述
             
-            # 4. 对比学习损失（新增 - 核心创新点）
-            # 拉近同类距离，拉远不同类距离
-            loss_contrast = self.contrastive_loss(
-                image_features, 
-                text_features, 
-                label
-            ) * self.cfg.TRAINER.BIOMED_CONTRAST.CONTRAST_LAMBDA
+            # 获取负样本embeddings并归一化
+            fixed_negative_embeddings = self.prompt_learner.fixed_negative_embeddings.cuda()
+            fixed_negative_embeddings = fixed_negative_embeddings / fixed_negative_embeddings.norm(dim=-1, keepdim=True)
             
-            # 总损失
-            total_loss = loss_ce + loss_l1 + loss_kl + loss_contrast
+            batch_size = label.size(0)
+            loss_repulsion = 0.0
             
-            return logits, total_loss
+            for i in range(batch_size):
+                # 获取当前样本的真实类别
+                true_class = label[i].item()
+                
+                # 获取该类别学到的文本特征 (1, dim)
+                current_text_feature = text_features[true_class:true_class+1, :]
+                
+                # 获取该类别对应的负样本特征 (n_cls-1, dim)
+                # 这些是用其他类名替换当前类名后的描述特征
+                negative_features = fixed_negative_embeddings[true_class, :, :]
+                
+                # 计算与所有负样本的余弦相似度 (1, n_cls-1)
+                similarities = current_text_feature @ negative_features.t()
+                
+                # 使用margin-based hinge loss
+                # 目标：让相似度小于 -margin（即尽可能不相似）
+                # loss = max(0, similarity + margin)
+                repulsion_loss = torch.clamp(similarities + self.margin, min=0.0).mean()
+                loss_repulsion += repulsion_loss
+            
+            loss_repulsion = loss_repulsion / batch_size
+            
+            # 获取排斥损失权重
+            loss_repulsion = loss_repulsion * self.repulsion_lambda
+            
+            # ===== 总损失 =====
+            total_loss = loss_ce + loss_l1 + loss_kl + loss_repulsion
+            
+            # 返回详细的损失字典用于监控
+            return logits, total_loss, {
+                'loss_ce': loss_ce.item(),
+                'loss_l1': loss_l1.item(),
+                'loss_kl': loss_kl.item(),
+                'loss_repulsion': loss_repulsion.item()
+            }
         else:
-            # 测试模式: 只返回logits
             return logits
 
 
 @TRAINER_REGISTRY.register()
-class BiomedContrast_BiomedCLIP(TrainerX):
+class BiomedDPT_BiomedCLIP(TrainerX):
     """
-    BiomedContrast训练器 - 基于BiomedCLIP的对比学习prompt tuning
+    BiomedDPT with BiomedCLIP backbone
     
-    主要特点:
-    1. 使用可学习的text和visual prompts
-    2. 添加类别级对比学习loss
-    3. 结合知识蒸馏（L1和KL loss）
+    新增负样本排斥策略：
+    - 通过替换类别名称生成负样本描述
+    - 例如："A normal brain..." -> "A glioma tumor..."
+    - 训练时让特征远离这些错误的描述
     """
     
     def check_cfg(self, cfg):
-        """检查配置"""
-        assert cfg.TRAINER.BIOMED_CONTRAST.PREC in ["fp16", "fp32", "amp"]
+        assert cfg.TRAINER.BIOMEDDPT.PREC in ["fp16", "fp32", "amp"]
 
     def build_model(self):
-        """构建模型"""
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
 
         print(f"Loading BiomedCLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         biomedclip_model, preprocess = create_model_from_pretrained(
-            'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
-            cache_dir='clip/checkpoints/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
-        )
+            'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224', 
+            cache_dir='clip/checkpoints/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
         
-        if cfg.TRAINER.BIOMED_CONTRAST.PREC == "fp32" or cfg.TRAINER.BIOMED_CONTRAST.PREC == "amp":
+        if cfg.TRAINER.BIOMEDDPT.PREC == "fp32" or cfg.TRAINER.BIOMEDDPT.PREC == "amp":
             biomedclip_model.float()
 
-        print("Building custom CLIP with contrastive learning")
+        print("Building custom CLIP with negative sample repulsion")
         self.model = CustomCLIP(cfg, classnames, biomedclip_model.eval())
 
         print("Turning off gradients in both the image and the text encoder")
-        # 只训练prompt learner的context
         names_to_update = ["prompt_learner.ctx"]
 
         for name, param in self.model.named_parameters():
             if name not in names_to_update:
                 param.requires_grad_(False)
         
-        # 验证哪些参数会被更新
+        # 确认需要更新的参数
         enabled = set()
         for name, param in self.model.named_parameters():
             if param.requires_grad:
@@ -426,60 +405,68 @@ class BiomedContrast_BiomedCLIP(TrainerX):
             load_pretrained_weights(self.model, cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
-        
-        # 构建优化器和调度器
+        # 只给prompt_learner优化器
         self.optim = build_optimizer(self.model, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("prompt_learner", self.model, self.optim, self.sched)
         
-        # 其他训练设置
+        # Cosine scheduler
         self.total_epochs = cfg.OPTIM.MAX_EPOCH
         self.step_counter = 1
-        self.scaler = GradScaler() if cfg.TRAINER.BIOMED_CONTRAST.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.BIOMEDDPT.PREC == "amp" else None
         
-        # 多GPU支持
+        # 多GPU训练支持
         device_count = torch.cuda.device_count()
         if device_count > 1:
             print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
             self.model = nn.DataParallel(self.model)
 
     def forward_backward(self, batch):
-        """前向传播和反向传播"""
         image, label = self.parse_batch_train(batch)
 
         model = self.model
         optim = self.optim
         scaler = self.scaler
 
-        prec = self.cfg.TRAINER.BIOMED_CONTRAST.PREC
-        
+        prec = self.cfg.TRAINER.BIOMEDDPT.PREC
         if prec == "amp":
-            # 混合精度训练
             with autocast():
-                logits, loss = model(image, label)
+                output = model(image, label)
+                if len(output) == 3:
+                    logits, loss, loss_dict = output
+                else:
+                    logits, loss = output
+                    loss_dict = {}
             optim.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(optim)
             scaler.update()
         else:
-            # 常规训练
-            logits, loss = model(image, label)
+            output = model(image, label)
+            if len(output) == 3:
+                logits, loss, loss_dict = output
+            else:
+                logits, loss = output
+                loss_dict = {}
+            
             self.model_backward_and_update(loss)
 
-        # 记录损失和准确率
+        # 构建损失摘要
         loss_summary = {
             "loss": loss.item(),
             "acc": compute_accuracy(logits, label)[0].item(),
         }
+        
+        # 添加详细的损失项
+        if loss_dict:
+            loss_summary.update(loss_dict)
 
-        # 每个epoch结束时更新学习率
         if (self.batch_idx + 1) == self.num_batches:
             self.update_lr()
 
         return loss_summary
 
     def parse_batch_train(self, batch):
-        """解析训练batch"""
         input = batch["img"]
         label = batch["label"]
         input = input.to(self.device)
@@ -487,7 +474,6 @@ class BiomedContrast_BiomedCLIP(TrainerX):
         return input, label
 
     def load_model(self, directory, epoch=None):
-        """加载预训练模型"""
         if not directory:
             print("Note that load_model() is skipped as no pretrained model is given")
             return
@@ -510,7 +496,7 @@ class BiomedContrast_BiomedCLIP(TrainerX):
             state_dict = checkpoint["state_dict"]
             epoch = checkpoint["epoch"]
 
-            # 忽略固定的token vectors（这些是从预训练模型来的）
+            # 忽略固定的token向量
             if "prompt_learner.token_prefix" in state_dict:
                 del state_dict["prompt_learner.token_prefix"]
 
@@ -518,5 +504,5 @@ class BiomedContrast_BiomedCLIP(TrainerX):
                 del state_dict["prompt_learner.token_suffix"]
 
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
-            # strict=False 允许部分加载
+            # 设置strict=False
             self._models[name].load_state_dict(state_dict, strict=False)

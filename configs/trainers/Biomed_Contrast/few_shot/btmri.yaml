@@ -15,7 +15,7 @@ INPUT:
 OPTIM:
   NAME: "sgd"
   LR: 0.0025
-  MAX_EPOCH: 100
+  MAX_EPOCH: 100  # Few-shot任务使用更多epoch
   LR_SCHEDULER: "cosine"
   WARMUP_EPOCH: 1
   WARMUP_TYPE: "constant"
@@ -35,10 +35,9 @@ TRAINER:
     KL_LAMBDA: 0.25
     N_PROMPTS: 50
     N_CTX: 5
-
-    CONTRAST_LAMBDA: 0.5
-    TEMPERATURE: 0.07
-    CSC: False
-    CLASS_TOKEN_POSITION: "end"
-    PREC: "fp16"
     
+    REPULSION_LAMBDA: 0.12
+    MARGIN: 0.30
+    CLASS_TOKEN_POSITION: "end"
+    PREC: "fp32"
+    CSC: False

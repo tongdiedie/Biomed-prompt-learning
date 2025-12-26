@@ -34,11 +34,10 @@ TRAINER:
     L1_LAMBDA: 65.0
     KL_LAMBDA: 2.5
     N_PROMPTS: 50
-    N_CTX: 6    
-    
-    CONTRAST_LAMBDA: 0.5
-    TEMPERATURE: 0.07
-    CSC: False
+    N_CTX: 6
+
+    REPULSION_LAMBDA: 0.18
+    MARGIN: 0.38
     CLASS_TOKEN_POSITION: "end"
-    PREC: "fp16"
-    
+    PREC: "fp32"
+    CSC: False
