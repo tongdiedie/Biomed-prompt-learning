@@ -1,3 +1,5 @@
+# 总损失公式
+# total_loss = loss_ce + loss_l1 + loss_kl + loss_repulsion * REPULSION_LAMBDA
 from collections import OrderedDict
 import copy
 import os.path as osp

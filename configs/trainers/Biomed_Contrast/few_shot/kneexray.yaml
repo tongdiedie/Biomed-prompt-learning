@@ -29,7 +29,7 @@ MODEL:
     NAME: "ViT-B/16"
 
 TRAINER:
-  BIOMEDDPT:
+  BIOMED_CONTRAST:
     CTX_INIT: "a frontal X-ray photo of a"
     L1_LAMBDA: 25.0
     KL_LAMBDA: 10.0

@@ -29,7 +29,7 @@ MODEL:
     NAME: "ViT-B/16"
 
 TRAINER:
-  BIOMEDDPT:
+  BIOMED_CONTRAST:
     CTX_INIT: "a ultrasound photo of a"
     L1_LAMBDA: 18.75
     KL_LAMBDA: 0.65

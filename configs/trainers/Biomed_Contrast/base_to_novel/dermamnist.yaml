@@ -29,7 +29,7 @@ MODEL:
     NAME: "ViT-B/16"
 
 TRAINER:
-  BIOMEDDPT:
+  BIOMED_CONTRAST:
     CTX_INIT: "a dermatoscopy photo of a"
     L1_LAMBDA: 11.5
     KL_LAMBDA: 5.0
