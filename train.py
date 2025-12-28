@@ -54,6 +54,10 @@ import trainers.BiomedDPT_Robust.biomeddpt_robust_biomedclip
 import trainers.BiomedDPT_Robust.biomeddpt_robust_clip
 import trainers.BiomedDPT_Robust.biomeddpt_robust_pubmedclip
 import trainers.BiomedDPT_Robust.biomeddpt_robust_pmcclip
+import trainers.BiomedAP.biomedap_biomedclip
+import trainers.BiomedAP.biomedap_clip
+import trainers.BiomedAP.biomedap_pubmedclip
+import trainers.BiomedAP.biomedap_pmcclip
 
 def print_args(args, cfg):
     print("***************")
@@ -195,7 +199,20 @@ def extend_cfg(cfg):
     cfg.TRAINER.BIOMEDCONTRAST.N_CTX = 4  # 上下文向量数量
     cfg.TRAINER.BIOMEDCONTRAST.PREC = "fp32"  # 精度：fp16, fp32, amp
     cfg.TRAINER.BIOMEDCONTRAST.N_PROMPTS = 50  # BiomedDPT模板数量
-    
+
+    # ========== 【新增】BiomedAP 配置 ==========
+    cfg.TRAINER.BIOMEDAP = CN()
+    cfg.TRAINER.BIOMEDAP.CTX_INIT = "a photo of a"
+    cfg.TRAINER.BIOMEDAP.CSC = False
+    cfg.TRAINER.BIOMEDAP.CLASS_TOKEN_POSITION = "middle"
+    cfg.TRAINER.BIOMEDAP.N_CTX = 4
+    cfg.TRAINER.BIOMEDAP.PREC = "fp32"
+    cfg.TRAINER.BIOMEDAP.N_PROMPTS = 50
+    cfg.TRAINER.BIOMEDAP.L1_LAMBDA_HIGH = 12.5
+    cfg.TRAINER.BIOMEDAP.KL_LAMBDA = 0.25
+    cfg.TRAINER.BIOMEDAP.L1_LAMBDA_LOW = 0.3
+    cfg.TRAINER.BIOMEDAP.LOW_TEMPLATE_TYPE = "minimal"
+
     # 损失权重参数
     cfg.TRAINER.BIOMEDCONTRAST.L1_LAMBDA = 12.5  # λ1: L1损失权重（与正样本对齐）
     cfg.TRAINER.BIOMEDCONTRAST.KL_LAMBDA = 0.25  # λ2: KL散度权重（与zero-shot对齐）

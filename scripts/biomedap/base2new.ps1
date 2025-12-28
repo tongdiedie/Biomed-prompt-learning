@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    BiomedDPT_Robust Base-to-New Training and Evaluation Script
+    BiomedAP Base-to-New Training and Evaluation Script
 .DESCRIPTION
     Usage: .\base2new.ps1 <DATA_PATH> <DATASET> <MODEL>
     Example: .\base2new.ps1 data btmri BiomedCLIP
@@ -20,7 +20,7 @@ param(
 
 # 配置参数
 $SHOTS = 16
-$LOADEP = 40
+$LOADEP = 50
 $CTP = "end"
 $CSC = "False"
 $NCTX = 4
@@ -28,13 +28,13 @@ $SUB_base = "base"
 $SUB_novel = "new"
 
 # Robust 参数配置
-$LOW_TEMPLATE_TYPE = "minimal"
+$LOW_TEMPLATE_TYPE = "minimal" # minimal empty medical_minimal
 #$L1_LAMBDA_HIGH = 0.5
 # $L1_LAMBDA_LOW = 0.3
 # $KL_LAMBDA = 0.1
 
-$METHOD = "BiomedDPT_Robust"
-$TRAINER = "BiomedDPT_Robust_$MODEL"
+$METHOD = "BiomedAP"
+$TRAINER = "BiomedAP_$MODEL"
 
 # 训练+评估 3 个不同的随机种子
 foreach ($SEED in 1..3) {
@@ -56,10 +56,10 @@ foreach ($SEED in 1..3) {
             --output-dir $DIR `
             DATASET.NUM_SHOTS $SHOTS `
             DATASET.SUBSAMPLE_CLASSES $SUB_base `
-            TRAINER.BIOMEDDPT_ROBUST.LOW_TEMPLATE_TYPE $LOW_TEMPLATE_TYPE `
-            # TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_HIGH $L1_LAMBDA_HIGH `
-            # TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_LOW $L1_LAMBDA_LOW `
-            # TRAINER.BIOMEDDPT_ROBUST.KL_LAMBDA $KL_LAMBDA
+            TRAINER.BiomedAP.LOW_TEMPLATE_TYPE $LOW_TEMPLATE_TYPE `
+            # TRAINER.BiomedAP.L1_LAMBDA_HIGH $L1_LAMBDA_HIGH `
+            # TRAINER.BiomedAP.L1_LAMBDA_LOW $L1_LAMBDA_LOW `
+            # TRAINER.BiomedAP.KL_LAMBDA $KL_LAMBDA
 
     }
     
@@ -86,10 +86,10 @@ foreach ($SEED in 1..3) {
             --eval-only `
             DATASET.NUM_SHOTS $SHOTS `
             DATASET.SUBSAMPLE_CLASSES $SUB_novel `
-            TRAINER.BIOMEDDPT_ROBUST.LOW_TEMPLATE_TYPE $LOW_TEMPLATE_TYPE `
-            # TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_HIGH $L1_LAMBDA_HIGH `
-            # TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_LOW $L1_LAMBDA_LOW `
-            # TRAINER.BIOMEDDPT_ROBUST.KL_LAMBDA $KL_LAMBDA
+            TRAINER.BiomedAP.LOW_TEMPLATE_TYPE $LOW_TEMPLATE_TYPE `
+            # TRAINER.BiomedAP.L1_LAMBDA_HIGH $L1_LAMBDA_HIGH `
+            # TRAINER.BiomedAP.L1_LAMBDA_LOW $L1_LAMBDA_LOW `
+            # TRAINER.BiomedAP.KL_LAMBDA $KL_LAMBDA
 
     }
 }

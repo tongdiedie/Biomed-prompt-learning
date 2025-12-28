@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    BiomedDPT_Robust Few-shot Training Script
+    BiomedAP Few-shot Training Script
 .DESCRIPTION
     Usage: .\few_shot.ps1 <DATA_PATH> <DATASET> <SHOTS> <MODEL>
     Example: .\few_shot.ps1 data btmri 16 BiomedCLIP
@@ -32,8 +32,8 @@ $LOW_TEMPLATE_TYPE = "minimal"  # 低质量模板类型: minimal, article, empty
 # $L1_LAMBDA_LOW = 0.3
 # $KL_LAMBDA = 0.1 
 
-$METHOD = "BiomedDPT_Robust"
-$TRAINER = "BiomedDPT_Robust_$MODEL"
+$METHOD = "BiomedAP"
+$TRAINER = "BiomedAP_$MODEL"
 
 # 训练 3 个不同的随机种子
 foreach ($SEED in 1..3) {
@@ -52,13 +52,13 @@ foreach ($SEED in 1..3) {
             --dataset-config-file configs/datasets/$DATASET.yaml `
             --config-file configs/trainers/$METHOD/few_shot/$DATASET.yaml `
             --output-dir $DIR `
-            TRAINER.BIOMEDDPT_ROBUST.N_CTX $NCTX `
-            TRAINER.BIOMEDDPT_ROBUST.CSC $CSC `
-            TRAINER.BIOMEDDPT_ROBUST.CLASS_TOKEN_POSITION $CTP `
-            TRAINER.BIOMEDDPT_ROBUST.LOW_TEMPLATE_TYPE $LOW_TEMPLATE_TYPE `
-            # TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_HIGH $L1_LAMBDA_HIGH `
-            # TRAINER.BIOMEDDPT_ROBUST.L1_LAMBDA_LOW $L1_LAMBDA_LOW `
-            # TRAINER.BIOMEDDPT_ROBUST.KL_LAMBDA $KL_LAMBDA `
+            TRAINER.BiomedAP.N_CTX $NCTX `
+            TRAINER.BiomedAP.CSC $CSC `
+            TRAINER.BiomedAP.CLASS_TOKEN_POSITION $CTP `
+            TRAINER.BiomedAP.LOW_TEMPLATE_TYPE $LOW_TEMPLATE_TYPE `
+            # TRAINER.BiomedAP.L1_LAMBDA_HIGH $L1_LAMBDA_HIGH `
+            # TRAINER.BiomedAP.L1_LAMBDA_LOW $L1_LAMBDA_LOW `
+            # TRAINER.BiomedAP.KL_LAMBDA $KL_LAMBDA `
             DATASET.NUM_SHOTS $SHOTS
     }
 }
