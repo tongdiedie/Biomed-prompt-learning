@@ -28,9 +28,7 @@ $CTP = "end"
 
 # 【新增】Robust 参数配置
 $LOW_TEMPLATE_TYPE = "minimal"  # 低质量模板类型: minimal, article, empty, medical_minimal, generic
-# $L1_LAMBDA_HIGH = 0.5
-# $L1_LAMBDA_LOW = 0.3
-# $KL_LAMBDA = 0.1 
+
 
 $METHOD = "BiomedAP"
 $TRAINER = "BiomedAP_$MODEL"
@@ -52,13 +50,10 @@ foreach ($SEED in 1..3) {
             --dataset-config-file configs/datasets/$DATASET.yaml `
             --config-file configs/trainers/$METHOD/few_shot/$DATASET.yaml `
             --output-dir $DIR `
-            TRAINER.BiomedAP.N_CTX $NCTX `
-            TRAINER.BiomedAP.CSC $CSC `
-            TRAINER.BiomedAP.CLASS_TOKEN_POSITION $CTP `
-            TRAINER.BiomedAP.LOW_TEMPLATE_TYPE $LOW_TEMPLATE_TYPE `
-            # TRAINER.BiomedAP.L1_LAMBDA_HIGH $L1_LAMBDA_HIGH `
-            # TRAINER.BiomedAP.L1_LAMBDA_LOW $L1_LAMBDA_LOW `
-            # TRAINER.BiomedAP.KL_LAMBDA $KL_LAMBDA `
+            TRAINER.BIOMEDAP.N_CTX $NCTX `
+            TRAINER.BIOMEDAP.CSC $CSC `
+            TRAINER.BIOMEDAP.CLASS_TOKEN_POSITION $CTP `
+            TRAINER.BIOMEDAP.LOW_TEMPLATE_TYPE $LOW_TEMPLATE_TYPE `
             DATASET.NUM_SHOTS $SHOTS
     }
 }

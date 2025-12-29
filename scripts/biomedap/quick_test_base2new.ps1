@@ -78,8 +78,8 @@ python train.py `
     --eval-only `
     DATASET.NUM_SHOTS $SHOTS `
     DATASET.SUBSAMPLE_CLASSES new `
-    TRAINER.BiomedAP.LOW_TEMPLATE_TYPE $LOW_TEMPLATE_TYPE `
-    TRAINER.BiomedAP.L1_LAMBDA_LOW $L1_LAMBDA_LOW
+    TRAINER.BIOMEDAP.LOW_TEMPLATE_TYPE $LOW_TEMPLATE_TYPE `
+    TRAINER.BIOMEDAP.L1_LAMBDA_LOW $L1_LAMBDA_LOW
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "`n========================================" -ForegroundColor Green

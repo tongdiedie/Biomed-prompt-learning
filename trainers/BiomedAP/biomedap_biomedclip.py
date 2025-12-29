@@ -10,6 +10,15 @@ BiomedDPT + Text-Guided Visual Prompt + Multi-Quality Robustness
 
 损失函数（4项，不变）:
 L = L_ce + λ1*L_L1_high + λ2*L_KL + λ3*L_L1_low
+
+【新增】测试时策略 - Class-conditioned Visual Prompting:
+- 对每个类别 c ∈ {0, 1, ..., K-1}:
+  1. 使用 text_global[c] 作为语义引导（来自50个模板的平均特征）
+  2. 生成该类别特定的视觉 prompts
+  3. 提取图像特征 image_features(c)
+  4. 计算 logits[:, c] = similarity(image_features(c), text_features[c])
+- 这种 test-time class-wise prompt conditioning 使每个类别获得定制化的视觉表示
+- 对于 BTMRI (K=4)，每张图只需 forward 4次，计算开销可接受
 """
 
 # ========== 环境配置 ==========
@@ -40,62 +49,119 @@ from trainers.prompt_templates import ZERO_SHOT_TEMPLATES
 from open_clip.src.open_clip import create_model_from_pretrained, get_tokenizer
 
 
-# ========== 【核心新增】Text-Guided Visual Prompt模块 ==========
+# # ========== 【核心新增】Text-Guided Visual Prompt模块 ==========
+# class TextGuidedVisualPrompt(nn.Module):
+#     """
+#     文本引导的视觉Prompt模块（共享投影层方案）
+    
+#     工作原理:
+#     1. 使用1个共享投影层将文本特征(512维)映射到视觉空间(768维)
+#     2. 每层视觉prompt通过加性融合文本语义: vp' = vp + scale * text_proj
+#     3. 层级缩放系数(layer_scales)自适应控制不同层的融合强度
+    
+#     参数量: ~393K (投影层) + 12 (缩放系数) + 12×4×768 (视觉prompt) ≈ 430K
+#     """
+#     def __init__(self, n_layers=12, n_prompts=4, dim=768, text_dim=512):
+#         super().__init__()
+        
+#         # 共享的文本投影层（所有层共用，减少参数量）
+#         self.shared_projector = nn.Linear(text_dim, dim)  # 512×768 = 393,216参数
+        
+#         # 每层的视觉prompt（可学习）
+#         self.visual_prompts = nn.ParameterList([
+#             nn.Parameter(torch.randn(n_prompts, dim) * 0.02)  # 小初始化
+#             for _ in range(n_layers)
+#         ])
+        
+#         # 每层的动态缩放系数（控制文本引导强度）
+#         self.layer_scales = nn.Parameter(torch.ones(n_layers))  # 初始化为1.0
+        
+#         # Dropout防止过拟合
+#         self.prompt_dropout = nn.Dropout(0.1)
+    
+#     def forward(self, text_global):
+#         """
+#         Args:
+#             text_global: 文本全局特征 [B, 512] (来自教师模型)
+        
+#         Returns:
+#             modulated_prompts: 调制后的视觉prompt列表，每个 [B, M, 768]
+#         """
+#         # 1. 文本特征投影到视觉空间（所有层共享此映射）
+#         text_proj = self.shared_projector(text_global)  # [B, 768]
+        
+#         modulated_prompts = []
+#         for i in range(len(self.visual_prompts)):
+#             # 2. 获取当前层的缩放系数（归一化到[0,1]）
+#             scale = torch.sigmoid(self.layer_scales[i])
+            
+#             # 3. 加性融合：视觉prompt + 文本语义
+#             # 原理：vp保留通用视觉模式，text_proj添加任务特定语义
+#             vp = self.visual_prompts[i]  # [M, 768]
+#             # 广播机制: [M,768] + scale*[B,1,768] → [B,M,768]
+#             modulated_vp = vp.unsqueeze(0) + scale * text_proj.unsqueeze(1)
+            
+#             # 4. 应用dropout
+#             modulated_vp = self.prompt_dropout(modulated_vp)
+            
+#             modulated_prompts.append(modulated_vp)
+        
+#         return modulated_prompts
 class TextGuidedVisualPrompt(nn.Module):
     """
-    文本引导的视觉Prompt模块（共享投影层方案）
+    文本引导的视觉Prompt模块（门控调制策略）
     
-    工作原理:
-    1. 使用1个共享投影层将文本特征(512维)映射到视觉空间(768维)
-    2. 每层视觉prompt通过加性融合文本语义: vp' = vp + scale * text_proj
-    3. 层级缩放系数(layer_scales)自适应控制不同层的融合强度
+    核心改进: 从加性融合改为门控调制
+    - 原方案：vp' = vp + scale * text_proj（加法）
+    - 新方案：vp' = vp ⊙ σ(gate) * scale（乘法门控）
     
-    参数量: ~393K (投影层) + 12 (缩放系数) + 12×4×768 (视觉prompt) ≈ 430K
+    参数量: ~983K
     """
     def __init__(self, n_layers=12, n_prompts=4, dim=768, text_dim=512):
         super().__init__()
         
-        # 共享的文本投影层（所有层共用，减少参数量）
-        self.shared_projector = nn.Linear(text_dim, dim)  # 512×768 = 393,216参数
+        # 文本到门控信号的映射
+        self.text_to_gate = nn.Sequential(
+            nn.Linear(text_dim, dim),      # 512 → 768
+            nn.ReLU(),
+            nn.Linear(dim, dim),           # 768 → 768
+            nn.Sigmoid()                   # 输出[0,1]门控信号
+        )
         
-        # 每层的视觉prompt（可学习）
-        self.visual_prompts = nn.ParameterList([
-            nn.Parameter(torch.randn(n_prompts, dim) * 0.02)  # 小初始化
+        # 可学习的基础prompts
+        self.base_prompts = nn.ParameterList([
+            nn.Parameter(torch.randn(n_prompts, dim) * 0.02)
             for _ in range(n_layers)
         ])
         
-        # 每层的动态缩放系数（控制文本引导强度）
-        self.layer_scales = nn.Parameter(torch.ones(n_layers))  # 初始化为1.0
+        # 层级缩放系数
+        self.layer_scales = nn.Parameter(torch.ones(n_layers))
         
-        # Dropout防止过拟合
+        # Dropout
         self.prompt_dropout = nn.Dropout(0.1)
     
     def forward(self, text_global):
         """
         Args:
-            text_global: 文本全局特征 [B, 512] (来自教师模型)
-        
+            text_global: [B, 512] 文本全局特征
         Returns:
-            modulated_prompts: 调制后的视觉prompt列表，每个 [B, M, 768]
+            List of [B, M, 768] 门控调制后的prompts
         """
-        # 1. 文本特征投影到视觉空间（所有层共享此映射）
-        text_proj = self.shared_projector(text_global)  # [B, 768]
+        B = text_global.size(0)
+        
+        # 生成门控信号（所有层共享）
+        gate = self.text_to_gate(text_global)  # [B, 768]
         
         modulated_prompts = []
-        for i in range(len(self.visual_prompts)):
-            # 2. 获取当前层的缩放系数（归一化到[0,1]）
-            scale = torch.sigmoid(self.layer_scales[i])
+        for i in range(len(self.base_prompts)):
+            base = self.base_prompts[i]  # [M, 768]
+            scale = self.layer_scales[i]
             
-            # 3. 加性融合：视觉prompt + 文本语义
-            # 原理：vp保留通用视觉模式，text_proj添加任务特定语义
-            vp = self.visual_prompts[i]  # [M, 768]
-            # 广播机制: [M,768] + scale*[B,1,768] → [B,M,768]
-            modulated_vp = vp.unsqueeze(0) + scale * text_proj.unsqueeze(1)
+            # 【核心】门控调制（逐元素相乘）
+            modulated = base.unsqueeze(0) * gate.unsqueeze(1) * scale
+            modulated = self.prompt_dropout(modulated)
             
-            # 4. 应用dropout
-            modulated_vp = self.prompt_dropout(modulated_vp)
-            
-            modulated_prompts.append(modulated_vp)
+            modulated_prompts.append(modulated)
         
         return modulated_prompts
 
@@ -356,59 +422,141 @@ class CustomCLIP(nn.Module):
         self.dtype = biomedclip_model.text.transformer.dtype
         self.total_epochs = cfg.OPTIM.MAX_EPOCH
         self.n_cls = len(classnames)
+    
+    # 第一版
+    # def forward(self, image, label=None):
+    #     """前向传播"""
+    #     tokenized_prompts = self.tokenized_prompts
+    #     logit_scale = self.logit_scale.exp()
 
+    #     prompts = self.prompt_learner()
+
+    #     # 提取文本特征
+    #     text_features = self.text_encoder(prompts, tokenized_prompts)
+        
+    #     # ========== 【关键】获取文本全局语义（用于引导视觉prompt）==========
+    #     # 使用教师模型的高质量文本特征作为全局语义
+    #     fixed_embeddings = self.prompt_learner.fixed_embeddings  # [N, 50, 512]
+    #     text_global = fixed_embeddings.mean(dim=1)  # [N, 512] 平均50个模板
+    #     text_global = text_global / text_global.norm(dim=-1, keepdim=True)  # 归一化
+        
+    #     # 根据当前batch的label获取对应的文本全局特征
+    #     if label is not None:
+    #         text_global_batch = text_global[label]  # [B, 512]
+    #     else:
+    #         # 测试时使用所有类的平均
+    #         text_global_batch = text_global.mean(dim=0, keepdim=True).expand(image.size(0), -1)
+        
+    #     # 提取图像特征（传入文本全局语义）
+    #     image_features = self.image_encoder(image.type(self.dtype), text_global_batch.cuda())
+        
+    #     # 归一化
+    #     image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+    #     text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        
+    #     # 高质量特征（教师）
+    #     fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
+    #     fixed_embeddings = fixed_embeddings.mean(dim=1)
+    #     fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
+        
+    #     # 低质量特征（鲁棒性锚点）
+    #     fixed_low_embeddings = self.prompt_learner.fixed_low_embeddings
+    #     fixed_low_embeddings = fixed_low_embeddings / fixed_low_embeddings.norm(dim=-1, keepdim=True)
+        
+    #     # 计算 logits
+    #     zero_shot_logits = logit_scale * image_features @ fixed_embeddings.cuda().t()
+    #     logits = logit_scale * image_features @ text_features.t()
+        
+    #     # ========== 训练模式：计算4项损失（保持你的原有逻辑不变）==========
+    #     if self.prompt_learner.training:
+    #         # 损失 1: 交叉熵
+    #         loss_ce = F.cross_entropy(logits, label)
+            
+    #         # 损失 2: L1 对齐（可学习 → 高质量）
+    #         loss_l1_high = F.l1_loss(
+    #             text_features, 
+    #             fixed_embeddings.cuda(), 
+    #             reduction='mean'
+    #         ) * self.cfg.TRAINER.BIOMEDAP.L1_LAMBDA_HIGH
+            
+    #         # 损失 3: KL 散度（知识蒸馏）
+    #         loss_kl = F.kl_div(
+    #             F.log_softmax(logits, dim=1),
+    #             F.log_softmax(zero_shot_logits, dim=1),
+    #             reduction='sum',
+    #             log_target=True
+    #         ) / logits.numel() * self.cfg.TRAINER.BIOMEDAP.KL_LAMBDA
+
+    #         # 损失 4: L1 鲁棒性约束（可学习 → 低质量）
+    #         loss_l1_low = F.l1_loss(
+    #             text_features, 
+    #             fixed_low_embeddings.cuda(), 
+    #             reduction='mean'
+    #         ) * self.cfg.TRAINER.BIOMEDAP.L1_LAMBDA_LOW
+
+    #         # 总损失（4项）
+    #         total_loss = loss_ce + loss_l1_high + loss_kl + loss_l1_low
+            
+    #         return logits, total_loss
+    #     else:
+    #         return logits
+
+    #第二版
     def forward(self, image, label=None):
-        """前向传播"""
+        """
+        前向传播
+        
+        训练模式（label provided）:
+            - 使用batch中样本的真实label获取text_global
+            - 返回 (logits, loss)
+        
+        测试模式（label=None）:
+            - 【新增】对每个类别c，用text_global[c]生成视觉prompt
+            - 返回 logits [B, K]
+        """
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
 
         prompts = self.prompt_learner()
-
-        # 提取文本特征
-        text_features = self.text_encoder(prompts, tokenized_prompts)
+        text_features = self.text_encoder(prompts, tokenized_prompts)  # [K, 512]
         
-        # ========== 【关键】获取文本全局语义（用于引导视觉prompt）==========
-        # 使用教师模型的高质量文本特征作为全局语义
-        fixed_embeddings = self.prompt_learner.fixed_embeddings  # [N, 50, 512]
-        text_global = fixed_embeddings.mean(dim=1)  # [N, 512] 平均50个模板
+        # ========== 预计算所有类别的text_global（用于引导视觉prompt）==========
+        fixed_embeddings = self.prompt_learner.fixed_embeddings  # [K, 50, 512]
+        text_global = fixed_embeddings.mean(dim=1)  # [K, 512] 平均50个模板
         text_global = text_global / text_global.norm(dim=-1, keepdim=True)  # 归一化
         
-        # 根据当前batch的label获取对应的文本全局特征
-        if label is not None:
+        # ========== 【关键修改】训练 vs 测试的不同处理 ==========
+        if self.training:
+            # ========== 训练模式：使用真实label对应的text_global ==========
+            assert label is not None, "Training requires labels"
             text_global_batch = text_global[label]  # [B, 512]
-        else:
-            # 测试时使用所有类的平均
-            text_global_batch = text_global.mean(dim=0, keepdim=True).expand(image.size(0), -1)
-        
-        # 提取图像特征（传入文本全局语义）
-        image_features = self.image_encoder(image.type(self.dtype), text_global_batch.cuda())
-        
-        # 归一化
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        
-        # 高质量特征（教师）
-        fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
-        fixed_embeddings = fixed_embeddings.mean(dim=1)
-        fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
-        
-        # 低质量特征（鲁棒性锚点）
-        fixed_low_embeddings = self.prompt_learner.fixed_low_embeddings
-        fixed_low_embeddings = fixed_low_embeddings / fixed_low_embeddings.norm(dim=-1, keepdim=True)
-        
-        # 计算 logits
-        zero_shot_logits = logit_scale * image_features @ fixed_embeddings.cuda().t()
-        logits = logit_scale * image_features @ text_features.t()
-        
-        # ========== 训练模式：计算4项损失（保持你的原有逻辑不变）==========
-        if self.prompt_learner.training:
+            
+            # 提取图像特征（传入文本全局语义）
+            image_features = self.image_encoder(image.type(self.dtype), text_global_batch.cuda())
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            
+            # 高质量特征（教师）
+            fixed_embeddings_norm = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
+            fixed_embeddings_mean = fixed_embeddings_norm.mean(dim=1)
+            fixed_embeddings_mean = fixed_embeddings_mean / fixed_embeddings_mean.norm(dim=-1, keepdim=True)
+            
+            # 低质量特征（鲁棒性锚点）
+            fixed_low_embeddings = self.prompt_learner.fixed_low_embeddings
+            fixed_low_embeddings = fixed_low_embeddings / fixed_low_embeddings.norm(dim=-1, keepdim=True)
+            
+            # 计算 logits
+            zero_shot_logits = logit_scale * image_features @ fixed_embeddings_mean.cuda().t()
+            logits = logit_scale * image_features @ text_features.t()
+            
+            # ========== 训练模式：计算4项损失（保持原有逻辑不变）==========
             # 损失 1: 交叉熵
             loss_ce = F.cross_entropy(logits, label)
             
             # 损失 2: L1 对齐（可学习 → 高质量）
             loss_l1_high = F.l1_loss(
                 text_features, 
-                fixed_embeddings.cuda(), 
+                fixed_embeddings_mean.cuda(), 
                 reduction='mean'
             ) * self.cfg.TRAINER.BIOMEDAP.L1_LAMBDA_HIGH
             
@@ -431,12 +579,37 @@ class CustomCLIP(nn.Module):
             total_loss = loss_ce + loss_l1_high + loss_kl + loss_l1_low
             
             return logits, total_loss
+        
         else:
-            return logits
+            # ========== 【方案3修改】测试模式：使用集成的text_global ==========
+            B = image.size(0)  # batch size
+            
+            # 【关键】使用所有类别的平均text_global（而不是逐类别forward）
+            text_global_avg = text_global.mean(dim=0, keepdim=True)  # [1, 512]
+            text_global_avg = text_global_avg.expand(B, -1)  # [B, 512] 广播到batch
+            
+            print(f"[Test] Using averaged text_global from all {self.n_cls} classes")
+            
+            # 用平均text_global引导视觉prompt，提取图像特征
+            image_features = self.image_encoder(
+                image.type(self.dtype), 
+                text_global_avg.cuda()
+            )  # [B, 512]
+            
+            # 归一化
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            
+            # 计算与所有类别文本特征的相似度
+            logits = logit_scale * image_features @ text_features.t()  # [B, K]
+            
+            return logits  # [B, K]
+        
+    
 
 
 @TRAINER_REGISTRY.register()
-class BIOMEDAP_BiomedCLIP(TrainerX):
+class BiomedAP_BiomedCLIP(TrainerX):
     """训练器"""
     def check_cfg(self, cfg):
         assert cfg.TRAINER.BIOMEDAP.PREC in ["fp16", "fp32", "amp"]

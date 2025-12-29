@@ -477,7 +477,7 @@ class CustomCLIP(nn.Module):
 
 
 @TRAINER_REGISTRY.register()
-class BIOMEDAP_PMCCLIP(TrainerX):
+class BiomedAP_PMCCLIP(TrainerX):
     """BiomedAP 训练器（PMC-CLIP backbone）"""
     
     def check_cfg(self, cfg):

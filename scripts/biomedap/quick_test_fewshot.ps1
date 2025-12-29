@@ -16,8 +16,8 @@ python train.py `
     --config-file configs/trainers/BiomedAP/few_shot/btmri.yaml `
     --output-dir output/quick_test_robust `
     # --eval-only `
-    TRAINER.BiomedAP.LOW_TEMPLATE_TYPE empty ` # minimal article generic medical_minimal empty
-    TRAINER.BiomedAP.L1_LAMBDA_LOW 0.3 `
+    TRAINER.BIOMEDAP.LOW_TEMPLATE_TYPE empty ` # minimal article generic medical_minimal empty
+    TRAINER.BIOMEDAP.L1_LAMBDA_LOW 0.3 `
     DATASET.NUM_SHOTS 16 `
     OPTIM.MAX_EPOCH 5
 

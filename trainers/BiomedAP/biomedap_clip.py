@@ -439,7 +439,7 @@ class CustomCLIP(nn.Module):
 
 
 @TRAINER_REGISTRY.register()
-class BIOMEDAP_CLIP(TrainerX):
+class BiomedAP_CLIP(TrainerX):
     """BiomedAP 训练器（CLIP backbone）"""
     def check_cfg(self, cfg):
         assert cfg.TRAINER.BIOMEDAP.PREC in ["fp16", "fp32", "amp"]
