@@ -15,7 +15,7 @@ INPUT:
 OPTIM:
   NAME: "sgd"
   LR: 0.0025
-  MAX_EPOCH: 40
+  MAX_EPOCH: 100
   LR_SCHEDULER: "cosine"
   WARMUP_EPOCH: 1
   WARMUP_TYPE: "constant"
@@ -39,3 +39,7 @@ TRAINER:
     
     L1_LAMBDA_LOW: 0.3
     LOW_TEMPLATE_TYPE: "minimal"
+
+    ENABLE_FUSION: True
+    FUSION_LAYERS: [5, 8]
+    ALIGNMENT_LAMBDA: 0.1

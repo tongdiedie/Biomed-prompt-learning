@@ -213,6 +213,10 @@ def extend_cfg(cfg):
     cfg.TRAINER.BIOMEDAP.L1_LAMBDA_LOW = 0.3
     cfg.TRAINER.BIOMEDAP.LOW_TEMPLATE_TYPE = "minimal"
 
+    cfg.TRAINER.BIOMEDAP.ENABLE_FUSION = False      # 是否启用跨模态融合
+    cfg.TRAINER.BIOMEDAP.FUSION_LAYERS = [5, 8]     # 融合层索引
+    cfg.TRAINER.BIOMEDAP.ALIGNMENT_LAMBDA = 0.0     # Prompt对齐损失权重
+
     # 损失权重参数
     cfg.TRAINER.BIOMEDCONTRAST.L1_LAMBDA = 12.5  # λ1: L1损失权重（与正样本对齐）
     cfg.TRAINER.BIOMEDCONTRAST.KL_LAMBDA = 0.25  # λ2: KL散度权重（与zero-shot对齐）

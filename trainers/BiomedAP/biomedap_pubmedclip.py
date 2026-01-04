@@ -1,15 +1,17 @@
 """
-BIOMEDAP (PubMedCLIP backbone)
-==============================
-Adaptive Prompt Learning with Text-Guided Visual Gating
+BiomedAP (PubMedCLIP backbone)
+========================
+Adaptive Prompt Learning with Cross-Modal Fusion (PubMedCLIP版本)
 
 核心创新:
-1. Text-to-Visual Prompt Gating：用文本全局语义动态调制每层视觉prompt
-2. 多质量文本蒸馏：高质量（50模板）+ 低质量（单模板）
-3. 四重损失优化：CE + L1_high + KL + L1_low
+1. Visual Prompt：在图像编码器的多层注入可学习的prompt tokens
+2. Text Prompt：可学习的上下文向量
+3. 跨模态融合：在指定层进行 Visual-Text Prompt 交互
+4. 多质量文本蒸馏：高质量（50模板）+ 低质量（单模板）
+5. 四重损失优化：CE + L1_high + KL + L1_low + Alignment
 
 损失函数:
-L = L_ce + λ1*L_L1_high + λ2*L_KL + λ3*L_L1_low
+L = L_ce + λ1*L_L1_high + λ2*L_KL + λ3*L_L1_low + λ4*L_alignment
 """
 
 # ========== 环境配置 ==========
@@ -27,164 +29,78 @@ import numpy as np
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.cuda.amp import GradScaler, autocast
-import requests
-from tqdm import tqdm
 
 from dassl.engine import TRAINER_REGISTRY, TrainerX
 from dassl.utils import load_pretrained_weights, load_checkpoint
 from dassl.optim import build_optimizer, build_lr_scheduler
 from dassl.metrics import compute_accuracy
-
 from trainers.prompt_templates import BIOMEDDPT_TEMPLATES
 from trainers.prompt_templates import CUSTOM_BIOMEDDPT_TEMPLATES
 from trainers.prompt_templates import ZERO_SHOT_TEMPLATES
+from trainers.cross_modal_fusion import CrossModalPromptFusion, LightweightCrossModalFusion
 
-from clip import clip
-from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
-
-_tokenizer = _Tokenizer()
-
-directory = "clip/checkpoints"
-
-# File URLs
-files = {
-    "PubMedCLIP_ViT32.pth": "https://huggingface.co/sarahESL/PubMedCLIP/resolve/main/PubMedCLIP_ViT32.pth?download=true",
-}
+# PubMedCLIP 相关导入
+from transformers import AutoTokenizer, AutoModel, CLIPVisionModel
 
 
-def download_file(url, filepath):
-    """下载模型文件（如果不存在）"""
-    print(f"Downloading {filepath}...")
-    response = requests.get(url, stream=True)
-    if response.status_code == 200:
-        total_size = int(response.headers.get('content-length', 0))
-        with open(filepath, "wb") as file:
-            with tqdm(total=total_size, unit='B', unit_scale=True, desc=filepath) as pbar:
-                for chunk in response.iter_content(chunk_size=1024):
-                    file.write(chunk)
-                    pbar.update(len(chunk))
-        print(f"{filepath} downloaded successfully.")
-    else:
-        print(f"Failed to download {filepath}. HTTP Status Code: {response.status_code}")
-
-
-def load_clip_to_cpu(cfg):
+def load_pubmedclip_to_cpu(cfg):
     """加载 PubMedCLIP 模型到 CPU"""
-    backbone_name = "ViT-B/32"
-    url = clip._MODELS[backbone_name]
-    model_path = clip._download(url)
-
-    try:
-        model = torch.jit.load(model_path, map_location="cpu").eval()
-        state_dict = None
-    except RuntimeError:
-        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-
-    model = clip.build_model(state_dict or model.state_dict())
-    checkpoint = torch.load(os.path.join(directory, "PubMedCLIP_ViT32.pth"), weights_only=True)
-    model.load_state_dict(checkpoint['state_dict'])
-
-    return model
-
-
-# ========== 【核心新增】Text-Guided Visual Prompt 模块 ==========
-class TextGuidedVisualPrompt(nn.Module):
-    """
-    文本引导的视觉Prompt模块（共享投影层方案）
+    # 加载视觉编码器 (CLIP ViT-B/16)
+    vision_model = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch16")
     
-    工作原理:
-    1. 使用1个共享投影层将文本特征(512维)映射到视觉空间(768维)
-    2. 每层视觉prompt通过加性融合文本语义: vp' = vp + scale * text_proj
-    3. 层级缩放系数(layer_scales)自适应控制不同层的融合强度
+    # 加载文本编码器 (PubMedBERT)
+    text_model = AutoModel.from_pretrained("microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext")
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext")
     
-    参数量: ~393K (投影层) + 12 (缩放系数) + 12×4×768 (视觉prompt) ≈ 430K
-    """
-    def __init__(self, n_layers=12, n_prompts=4, dim=768, text_dim=512):
-        super().__init__()
-        
-        # 共享的文本投影层（所有层共用，减少参数量）
-        self.shared_projector = nn.Linear(text_dim, dim)  # 512×768 = 393,216参数
-        
-        # 每层的视觉prompt（可学习）
-        self.visual_prompts = nn.ParameterList([
-            nn.Parameter(torch.randn(n_prompts, dim) * 0.02)  # 小初始化
-            for _ in range(n_layers)
-        ])
-        
-        # 每层的动态缩放系数（控制文本引导强度）
-        self.layer_scales = nn.Parameter(torch.ones(n_layers))  # 初始化为1.0
-        
-        # Dropout防止过拟合
-        self.prompt_dropout = nn.Dropout(0.1)
+    # 创建投影层（768维 -> 512维，与CLIP对齐）
+    text_projection = nn.Linear(768, 512)
     
-    def forward(self, text_global):
-        """
-        Args:
-            text_global: 文本全局特征 [B, 512] (来自教师模型)
-        
-        Returns:
-            modulated_prompts: 调制后的视觉prompt列表，每个 [B, M, 768]
-        """
-        # 1. 文本特征投影到视觉空间（所有层共享此映射）
-        text_proj = self.shared_projector(text_global)  # [B, 768]
-        
-        modulated_prompts = []
-        for i in range(len(self.visual_prompts)):
-            # 2. 获取当前层的缩放系数（归一化到[0,1]）
-            scale = torch.sigmoid(self.layer_scales[i])
-            
-            # 3. 加性融合：视觉prompt + 文本语义
-            vp = self.visual_prompts[i]  # [M, 768]
-            # 广播机制: [M,768] + scale*[B,1,768] → [B,M,768]
-            modulated_vp = vp.unsqueeze(0) + scale * text_proj.unsqueeze(1)
-            
-            # 4. 应用dropout
-            modulated_vp = self.prompt_dropout(modulated_vp)
-            
-            modulated_prompts.append(modulated_vp)
-        
-        return modulated_prompts
+    return vision_model, text_model, text_projection, tokenizer
 
 
 class TextEncoder(nn.Module):
     """文本编码器"""
-    def __init__(self, clip_model):
+    def __init__(self, text_model, text_projection):
         super().__init__()
-        self.transformer = clip_model.transformer
-        self.positional_embedding = clip_model.positional_embedding
-        self.ln_final = clip_model.ln_final
-        self.text_projection = clip_model.text_projection
-        self.dtype = clip_model.dtype
+        self.text_model = text_model
+        self.text_projection = text_projection
+        self.dtype = torch.float32
 
-    def forward(self, prompts, tokenized_prompts):
-        x = prompts + self.positional_embedding.type(self.dtype)
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.ln_final(x).type(self.dtype)
-        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
-        return x
+    def forward(self, prompts, attention_mask):
+        """
+        Args:
+            prompts: 嵌入向量 [n_cls, seq_len, 768]
+            attention_mask: 注意力掩码 [n_cls, seq_len]
+        """
+        outputs = self.text_model(
+            inputs_embeds=prompts,
+            attention_mask=attention_mask
+        )
+        pooled_output = outputs.pooler_output  # [n_cls, 768]
+        text_features = self.text_projection(pooled_output)  # [n_cls, 512]
+        return text_features
 
 
 class PromptLearner(nn.Module):
-    """Prompt学习器（集成高质量 + 低质量特征预计算）"""
-    def __init__(self, cfg, classnames, clip_model):
+    """Prompt 学习器（集成高质量 + 低质量特征预计算）"""
+    def __init__(self, cfg, classnames, text_model, text_projection, tokenizer):
         super().__init__()
         n_cls = len(classnames)
         n_ctx = cfg.TRAINER.BIOMEDAP.N_CTX
         ctx_init = cfg.TRAINER.BIOMEDAP.CTX_INIT
-        dtype = clip_model.dtype
-        ctx_dim = clip_model.ln_final.weight.shape[0]
-        clip_imsize = clip_model.visual.input_resolution
+        dtype = torch.float32
+        ctx_dim = 768  # PubMedBERT hidden size
+        clip_imsize = 224
         cfg_imsize = cfg.INPUT.SIZE[0]
+        self.tokenizer = tokenizer
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
         # 初始化可学习上下文向量
-        if ctx_init and n_ctx <= 4:
+        if ctx_init:
             ctx_init = ctx_init.replace("_", " ")
-            prompt = clip.tokenize(ctx_init)
+            prompt_tokens = tokenizer(ctx_init, return_tensors='pt')
             with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(dtype)
+                embedding = text_model.embeddings.word_embeddings(prompt_tokens['input_ids']).type(dtype)
             ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
             prompt_prefix = ctx_init
         else:
@@ -198,31 +114,31 @@ class PromptLearner(nn.Module):
 
         # 处理类名
         classnames = [name.replace("_", " ") for name in classnames]
-        self.classnames = classnames  # 保存类名（用于低质量prompt生成）
-        name_lens = [len(_tokenizer.encode(name)) for name in classnames]
+        self.classnames = classnames
+        name_lens = [len(tokenizer.encode(name)) for name in classnames]
         
         # 使用中等质量模板
         temp = CUSTOM_BIOMEDDPT_TEMPLATES[cfg.DATASET.NAME]
         prompts = [temp.format(c.replace("_", " ")) for c in classnames]
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
-        
-        # 加载教师模型
-        clip_model_temp = load_clip_to_cpu(cfg).float().cuda()
-        clip_model_temp_image = load_clip_to_cpu(cfg).float().cuda()
+        tokenized_prompts = tokenizer(prompts, padding='max_length', truncation=True, max_length=77, return_tensors='pt')
         
         with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
-            self.ZS_image_encoder = clip_model_temp_image.visual
+            embedding = text_model.embeddings.word_embeddings(tokenized_prompts['input_ids']).type(dtype)
             
             # ========== 预计算高质量特征（50个模板）==========
             all_teacher_features = []
             num_temp = cfg.TRAINER.BIOMEDAP.N_PROMPTS
             for i in range(num_temp):
-                x_tokenized = torch.cat([
-                    clip.tokenize(BIOMEDDPT_TEMPLATES[classname][i]) 
-                    for classname in classnames
-                ])
-                text_features = clip_model_temp.encode_text(x_tokenized.cuda())
+                template_prompts = [BIOMEDDPT_TEMPLATES[cls][i] for cls in classnames]
+                template_tokens = tokenizer(template_prompts, padding='max_length', truncation=True, max_length=77, return_tensors='pt')
+                
+                # 编码文本
+                outputs = text_model(
+                    input_ids=template_tokens['input_ids'].cuda(),
+                    attention_mask=template_tokens['attention_mask'].cuda()
+                )
+                pooled_output = outputs.pooler_output
+                text_features = text_projection(pooled_output)
                 all_teacher_features.append(text_features.unsqueeze(1))
 
         self.fixed_embeddings = torch.cat(all_teacher_features, dim=1)  # [N, 50, 512]
@@ -243,29 +159,28 @@ class PromptLearner(nn.Module):
             low_quality_prompts = ["X" for _ in classnames]
             print("Using 'X' as low-quality prompt")
         else:
-            low_quality_prompts = [
-                template.format(**{"class": cls}) for cls in classnames
-            ]
+            low_quality_prompts = [template.format(**{"class": cls}) for cls in classnames]
             print(f"Low-quality prompt examples (first 3):")
             for cls, prompt in zip(classnames[:3], low_quality_prompts[:3]):
                 print(f"  {cls:15} -> '{prompt}'")
         
         # 预计算低质量特征
         with torch.no_grad():
-            low_tokenized = torch.cat([
-                clip.tokenize(p if p else "X") for p in low_quality_prompts
-            ])
-            low_text_features = clip_model_temp.encode_text(low_tokenized.cuda())
+            low_tokens = tokenizer(low_quality_prompts, padding='max_length', truncation=True, max_length=77, return_tensors='pt')
+            outputs = text_model(
+                input_ids=low_tokens['input_ids'].cuda(),
+                attention_mask=low_tokens['attention_mask'].cuda()
+            )
+            pooled_output = outputs.pooler_output
+            low_text_features = text_projection(pooled_output)
         
         self.fixed_low_embeddings = low_text_features  # [N, 512]
         print(f"[OK] Low-quality Prompt initialized\n")
-        
-        del clip_model_temp  # 释放内存
-        del clip_model_temp_image
 
         # 保存 token 前缀和后缀
         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
         self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
+        self.register_buffer("attention_mask", tokenized_prompts['attention_mask'])
 
         self.n_cls = n_cls
         self.n_ctx = n_ctx
@@ -273,7 +188,7 @@ class PromptLearner(nn.Module):
         self.name_lens = name_lens
 
     def construct_prompts(self, ctx, prefix, suffix, label=None):
-        """构造完整的Prompt"""
+        """构造完整的 Prompt"""
         if label is not None:
             prefix = prefix[label]
             suffix = suffix[label]
@@ -292,184 +207,287 @@ class PromptLearner(nn.Module):
         return prompts
 
 
-# ========== 【关键修改】集成 Text-Guided Prompt 的图像编码器 ==========
 class CLIP_Inplanted(nn.Module):
-    """
-    带文本引导视觉Prompt的图像编码器
-    
-    改进对比:
-    - 原版: 所有样本共享固定的视觉prompt
-    - 现在: 视觉prompt根据文本语义动态调制（text-guided）
-    """
-    def __init__(self, clip_model, text_guided_prompt):
+    """带Visual Prompt和跨模态交互的图像编码器"""
+    def __init__(self, vision_model, enable_fusion=False, fusion_layers=[5, 8]):
         super().__init__()
-        self.clipmodel = clip_model
-        self.image_encoder = clip_model.visual
-        self.dtype = clip_model.dtype
+        self.vision_model = vision_model
+        self.dtype = torch.float32
+        self.num_tokens = 4
+        self.prompt_dim = 768
+        self.prompt_embeddings = torch.zeros(1, self.num_tokens, self.prompt_dim)
+        self.deep_prompt_embeddings = torch.zeros(12, self.num_tokens, self.prompt_dim)
+        self.prompt_dropout = nn.Dropout(0.5)
         
-        # 【核心】文本引导的视觉prompt模块
-        self.text_guided_prompt = text_guided_prompt
-        self.num_tokens = 4  # 每层prompt的token数量
+        # ========== 跨模态融合配置 ==========
+        self.enable_fusion = enable_fusion
+        self.fusion_layers = fusion_layers
+        
+        if enable_fusion:
+            print(f"[FUSION] Enabling Cross-Modal Fusion at layers: {fusion_layers}")
+            self.fusion_modules = nn.ModuleDict({
+                str(layer): CrossModalPromptFusion(dim=768, num_heads=8, dropout=0.1)
+                for layer in fusion_layers
+            })
+            print(f"[FUSION] Created {len(self.fusion_modules)} fusion modules")
+        
+        self.visual_prompts_cache = {}
 
-    def forward(self, x, text_global):
+    def forward(self, x, text_prompts=None, label=None):
         """
+        注入Visual Prompt并与Text Prompt交互的前向传播
+        
         Args:
             x: 输入图像 [B, 3, 224, 224]
-            text_global: 文本全局特征 [B, 512] (来自教师模型)
-        
-        Returns:
-            image_features: 图像特征 [B, 512]
+            text_prompts: Text Prompt特征 [n_cls, n_ctx, 768] (可选)
+            label: 真实标签 [B] (训练时使用)
         """
-        # 1. 获取文本引导的视觉prompts（每层动态调制）
-        modulated_prompts = self.text_guided_prompt(text_global)  # List[Tensor[B,M,768]]
+        # Patch embedding
+        embeddings = self.vision_model.vision_model.embeddings(x)
+        x = embeddings  # [B, 197, 768] (1 CLS + 196 patches)
         
-        # 2. Patch embedding
-        x = self.image_encoder.conv1(x)
-        x = x.reshape(x.shape[0], x.shape[1], -1)
-        x = x.permute(0, 2, 1)
-        x = torch.cat([
-            self.image_encoder.class_embedding.to(x.dtype) + 
-            torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), 
-            x
-        ], dim=1)
-        x = x + self.image_encoder.positional_embedding.to(x.dtype)
-        x = self.image_encoder.ln_pre(x)
-        
-        # 3. 注入第0层的文本引导prompt（浅层特征）
+        # 注入浅层Visual Prompt
         B = x.shape[0]
-        shallow_prompt = modulated_prompts[0]  # [B, M, 768]
         x = torch.cat((
-            x[:, :1, :],           # CLS token
-            shallow_prompt,        # 文本引导的浅层prompt
-            x[:, 1:, :]            # 其他patch tokens
+            x[:, :1, :],
+            self.prompt_dropout(self.prompt_embeddings.expand(B, -1, -1).cuda()),
+            x[:, 1+self.num_tokens:, :]
         ), dim=1)
         
-        # 4. Transformer blocks（每层注入对应的文本引导prompt）
-        for i in range(12):
-            deep_prompt = modulated_prompts[i]  # [B, M, 768]
-            x = torch.cat((
-                x[:, :1, :],                         # CLS token
-                deep_prompt,                         # 文本引导的深层prompt
-                x[:, 1+self.num_tokens:, :]          # 其他tokens（去掉上一层的prompt）
-            ), dim=1)
-            x = x.permute(1, 0, 2)  # NLD -> LND
-            x = self.image_encoder.transformer.resblocks[i](x)
-            x = x.permute(1, 0, 2)  # LND -> NLD
+        # ========== 根据训练/测试选择不同策略 ==========
+        if self.training and label is not None:
+            # ========== 训练时：标准流程 ==========
+            for i in range(12):
+                B = x.shape[0]
+                
+                # 注入深层Visual Prompt
+                current_visual_prompts = self.prompt_dropout(
+                    self.deep_prompt_embeddings[i].expand(B, -1, -1).cuda()
+                )
+                x = torch.cat((
+                    x[:, :1, :],
+                    current_visual_prompts,
+                    x[:, 1+self.num_tokens:, :]
+                ), dim=1)
+                
+                # 在指定层融合
+                if self.enable_fusion and i in self.fusion_layers and text_prompts is not None:
+                    curr_visual_prompts = x[:, 1:1+self.num_tokens, :]
+                    curr_text_prompts = text_prompts[label]
+                    
+                    fusion_module = self.fusion_modules[str(i)]
+                    enhanced_visual, enhanced_text = fusion_module(
+                        curr_visual_prompts,
+                        curr_text_prompts
+                    )
+                    
+                    x = torch.cat([
+                        x[:, :1, :],
+                        enhanced_visual,
+                        x[:, 1+self.num_tokens:, :]
+                    ], dim=1)
+                    
+                    self.visual_prompts_cache[f'layer_{i}_text'] = enhanced_text
+                
+                # 执行Transformer block
+                x = self.vision_model.vision_model.encoder.layers[i](x)[0]
+            
+            # 最终投影
+            x = self.vision_model.vision_model.post_layernorm(x)
+            x = x[:, 0, :]  # CLS token
+            x = self.vision_model.visual_projection(x)
+            return x
         
-        # 5. 最终投影
-        x = self.image_encoder.ln_post(x[:, 0, :])
-        if self.image_encoder.proj is not None:
-            x = x @ self.image_encoder.proj
-        return x
+        else:
+            # ========== 测试时：不同策略 ==========
+            if not self.enable_fusion or text_prompts is None:
+                # 如果未启用融合，直接走标准流程
+                for i in range(12):
+                    B = x.shape[0]
+                    current_visual_prompts = self.prompt_dropout(
+                        self.deep_prompt_embeddings[i].expand(B, -1, -1).cuda()
+                    )
+                    x = torch.cat((
+                        x[:, :1, :],
+                        current_visual_prompts,
+                        x[:, 1+self.num_tokens:, :]
+                    ), dim=1)
+                    x = self.vision_model.vision_model.encoder.layers[i](x)[0]
+                
+                x = self.vision_model.vision_model.post_layernorm(x)
+                x = x[:, 0, :]
+                x = self.vision_model.visual_projection(x)
+                return x
+            
+            # ========== 测试时：为每个类别分别提取特征 ==========
+            assert self.enable_fusion, "[ERROR] Fusion should be enabled in test mode!"
+            assert text_prompts is not None, "[ERROR] text_prompts is None!"
+            print(f"[INFO] Test mode: Multi-class fusion activated, n_cls={text_prompts.shape[0]}")
+            
+            n_cls = text_prompts.shape[0]
+            all_image_features = []
+            
+            for c in range(n_cls):
+                # 为第c个类别提取特征
+                x_c = x.clone()
+                
+                for i in range(12):
+                    current_visual_prompts = self.prompt_dropout(
+                        self.deep_prompt_embeddings[i].expand(B, -1, -1).cuda()
+                    )
+                    x_c = torch.cat((
+                        x_c[:, :1, :],
+                        current_visual_prompts,
+                        x_c[:, 1+self.num_tokens:, :]
+                    ), dim=1)
+                    
+                    # 在指定层融合（使用第c个类别的text prompt）
+                    if i in self.fusion_layers:
+                        curr_visual_prompts = x_c[:, 1:1+self.num_tokens, :]
+                        curr_text_prompts = text_prompts[c:c+1].expand(B, -1, -1)
+                        
+                        fusion_module = self.fusion_modules[str(i)]
+                        enhanced_visual, _ = fusion_module(
+                            curr_visual_prompts,
+                            curr_text_prompts
+                        )
+                        
+                        x_c = torch.cat([
+                            x_c[:, :1, :],
+                            enhanced_visual,
+                            x_c[:, 1+self.num_tokens:, :]
+                        ], dim=1)
+                    
+                    # 执行Transformer block
+                    x_c = self.vision_model.vision_model.encoder.layers[i](x_c)[0]
+                
+                # 最终投影
+                x_c = self.vision_model.vision_model.post_layernorm(x_c)
+                x_c = x_c[:, 0, :]
+                x_c = self.vision_model.visual_projection(x_c)
+                
+                all_image_features.append(x_c.unsqueeze(1))  # [B, 1, dim]
+            
+            # 堆叠所有类别的特征
+            all_image_features = torch.cat(all_image_features, dim=1)  # [B, n_cls, dim]
+            
+            # 缓存供CustomCLIP使用
+            print(f"[DEBUG] Writing to cache: shape={all_image_features.shape}")
+            self.visual_prompts_cache['all_cls_features'] = all_image_features
+            
+            # 返回第一个类别的特征（兼容原接口）
+            return all_image_features[:, 0, :]
 
 
 class CustomCLIP(nn.Module):
-    """自定义 CLIP 模型（集成 Text-Guided + 4个损失函数）"""
-    def __init__(self, cfg, classnames, clip_model):
+    """自定义 CLIP 模型（集成跨模态融合 + 5个损失函数）"""
+    def __init__(self, cfg, classnames, vision_model, text_model, text_projection, tokenizer):
         super().__init__()
-        self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
+        self.prompt_learner = PromptLearner(cfg, classnames, text_model, text_projection, tokenizer)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.cfg = cfg
         
-        # ========== 【核心新增】创建 Text-Guided Prompt 模块 ==========
-        n_ctx = cfg.TRAINER.BIOMEDAP.N_CTX
-        self.text_guided_prompt = TextGuidedVisualPrompt(
-            n_layers=12,       # ViT-B/32 有 12 层
-            n_prompts=4,       # 每层 4 个 prompt tokens
-            dim=768,           # ViT-B/32 的 hidden_dim
-            text_dim=512       # PubMedCLIP 的文本特征维度
-        )
-        print(f"[Text-Guided Prompt] Initialized with {n_ctx} visual prompts per layer")
+        # ========== 传入融合配置 ==========
+        enable_fusion = cfg.TRAINER.BIOMEDAP.ENABLE_FUSION if hasattr(cfg.TRAINER.BIOMEDAP, 'ENABLE_FUSION') else False
+        fusion_layers = cfg.TRAINER.BIOMEDAP.FUSION_LAYERS if hasattr(cfg.TRAINER.BIOMEDAP, 'FUSION_LAYERS') else [5, 8]
         
-        # 图像编码器（传入 text_guided_prompt 模块）
-        self.image_encoder = CLIP_Inplanted(clip_model, self.text_guided_prompt)
-        self.text_encoder = TextEncoder(clip_model)
-        self.logit_scale = clip_model.logit_scale
-        self.dtype = clip_model.dtype
+        self.image_encoder = CLIP_Inplanted(
+            vision_model,
+            enable_fusion=enable_fusion,
+            fusion_layers=fusion_layers
+        )
+        
+        self.text_encoder = TextEncoder(text_model, text_projection)
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.dtype = torch.float32
         self.total_epochs = cfg.OPTIM.MAX_EPOCH
         self.n_cls = len(classnames)
+        
+        # ========== Prompt对齐损失权重 ==========
+        self.alignment_lambda = cfg.TRAINER.BIOMEDAP.ALIGNMENT_LAMBDA if hasattr(cfg.TRAINER.BIOMEDAP, 'ALIGNMENT_LAMBDA') else 0.0
 
     def forward(self, image, label=None):
-        """前向传播"""
-        tokenized_prompts = self.tokenized_prompts
+        """前向传播(添加跨模态交互)"""
+        attention_mask = self.prompt_learner.attention_mask
         logit_scale = self.logit_scale.exp()
 
-        prompts = self.prompt_learner()
-
+        # ========== 获取text prompts的中间表示 ==========
+        prompts = self.prompt_learner()  # [n_cls, seq_len, 768]
+        
+        # 提取text context部分(去掉prefix和suffix)
+        n_ctx = self.prompt_learner.n_ctx
+        text_ctx = prompts[:, 1:1+n_ctx, :]  # [n_cls, n_ctx, 768]
+        
+        # ========== 提取图像特征(传入text prompts) ==========
+        image_features = self.image_encoder(
+            image.type(self.dtype),
+            text_prompts=text_ctx,
+            label=label
+        )
+        
         # 提取文本特征
-        text_features = self.text_encoder(prompts, tokenized_prompts)
-        
-        # ========== 【关键】获取文本全局语义（用于引导视觉prompt）==========
-        # 使用教师模型的高质量文本特征作为全局语义
-        fixed_embeddings = self.prompt_learner.fixed_embeddings  # [N, 50, 512]
-        text_global = fixed_embeddings.mean(dim=1)  # [N, 512] 平均50个模板
-        text_global = text_global / text_global.norm(dim=-1, keepdim=True)  # 归一化
-        
-        # 根据当前batch的label获取对应的文本全局特征
-        if label is not None:
-            text_global_batch = text_global[label]  # [B, 512]
-        else:
-            # 测试时使用所有类的平均
-            text_global_batch = text_global.mean(dim=0, keepdim=True).expand(image.size(0), -1)
-        
-        # 提取图像特征（传入文本全局语义）
-        image_features = self.image_encoder(image.type(self.dtype), text_global_batch.cuda())
+        text_features = self.text_encoder(prompts, attention_mask)
         
         # 归一化
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         
-        # 高质量特征（教师）
+        # 高质量特征(教师)
+        fixed_embeddings = self.prompt_learner.fixed_embeddings
         fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
         fixed_embeddings = fixed_embeddings.mean(dim=1)
         fixed_embeddings = fixed_embeddings / fixed_embeddings.norm(dim=-1, keepdim=True)
         
-        # 低质量特征（鲁棒性锚点）
+        # 低质量特征(鲁棒性锚点)
         fixed_low_embeddings = self.prompt_learner.fixed_low_embeddings
         fixed_low_embeddings = fixed_low_embeddings / fixed_low_embeddings.norm(dim=-1, keepdim=True)
         
-        # 计算 logits
-        zero_shot_logits = logit_scale * image_features @ fixed_embeddings.cuda().t()
-        logits = logit_scale * image_features @ text_features.t()
-        
-        # ========== 训练模式：计算4项损失 ==========
         if self.prompt_learner.training:
-            # 损失 1: 交叉熵
+            # ========== 训练时：标准流程 ==========
+            zero_shot_logits = logit_scale * image_features @ fixed_embeddings.cuda().t()
+            logits = logit_scale * image_features @ text_features.t()
+            
             loss_ce = F.cross_entropy(logits, label)
+            loss_l1_high = F.l1_loss(text_features, fixed_embeddings.cuda(), reduction='mean') * self.cfg.TRAINER.BIOMEDAP.L1_LAMBDA_HIGH
+            loss_kl = F.kl_div(F.log_softmax(logits, dim=1), F.log_softmax(zero_shot_logits, dim=1), reduction='sum', log_target=True) / logits.numel() * self.cfg.TRAINER.BIOMEDAP.KL_LAMBDA
+            loss_l1_low = F.l1_loss(text_features, fixed_low_embeddings.cuda(), reduction='mean') * self.cfg.TRAINER.BIOMEDAP.L1_LAMBDA_LOW
             
-            # 损失 2: L1 对齐（可学习 → 高质量）
-            loss_l1_high = F.l1_loss(
-                text_features, 
-                fixed_embeddings.cuda(), 
-                reduction='mean'
-            ) * self.cfg.TRAINER.BIOMEDAP.L1_LAMBDA_HIGH
+            loss_alignment = 0.0
+            if self.alignment_lambda > 0 and hasattr(self.image_encoder, 'visual_prompts_cache'):
+                cache = self.image_encoder.visual_prompts_cache
+                if len(cache) > 0:
+                    for key, enhanced_text in cache.items():
+                        if 'layer' in key:
+                            curr_text = text_ctx[label]
+                            enhanced_pooled = F.normalize(enhanced_text.mean(dim=1), dim=-1)
+                            curr_pooled = F.normalize(curr_text.mean(dim=1), dim=-1)
+                            alignment_sim = (enhanced_pooled * curr_pooled).sum(dim=-1).mean()
+                            loss_alignment += (1 - alignment_sim)
+                    loss_alignment /= len([k for k in cache.keys() if 'layer' in k])
+                    loss_alignment *= self.alignment_lambda
             
-            # 损失 3: KL 散度（知识蒸馏）
-            loss_kl = F.kl_div(
-                F.log_softmax(logits, dim=1),
-                F.log_softmax(zero_shot_logits, dim=1),
-                reduction='sum',
-                log_target=True
-            ) / logits.numel() * self.cfg.TRAINER.BIOMEDAP.KL_LAMBDA
-
-            # 损失 4: L1 鲁棒性约束（可学习 → 低质量）
-            loss_l1_low = F.l1_loss(
-                text_features, 
-                fixed_low_embeddings.cuda(), 
-                reduction='mean'
-            ) * self.cfg.TRAINER.BIOMEDAP.L1_LAMBDA_LOW
-
-            # 总损失（4项）
-            total_loss = loss_ce + loss_l1_high + loss_kl + loss_l1_low
-            
+            total_loss = loss_ce + loss_l1_high + loss_kl + loss_l1_low + loss_alignment
             return logits, total_loss
+        
         else:
+            # ========== 测试时：使用多类别特征 ==========
+            if hasattr(self.image_encoder, 'visual_prompts_cache') and 'all_cls_features' in self.image_encoder.visual_prompts_cache:
+                print("[INFO] Using multi-class features from cache")
+                all_image_features = self.image_encoder.visual_prompts_cache['all_cls_features']
+                all_image_features = all_image_features / all_image_features.norm(dim=-1, keepdim=True)
+                print(f"[INFO] Using multi-class features, shape: {all_image_features.shape}")
+                
+                logits = logit_scale * (all_image_features * text_features.unsqueeze(0)).sum(dim=-1)
+            else:
+                print("[WARNING] all_cls_features not in cache, using fallback!")
+                logits = logit_scale * image_features @ text_features.t()
+            
             return logits
 
 
 @TRAINER_REGISTRY.register()
 class BiomedAP_PubMedCLIP(TrainerX):
-    """BiomedAP 训练器（PubMedCLIP backbone）"""
+    """训练器"""
     def check_cfg(self, cfg):
         assert cfg.TRAINER.BIOMEDAP.PREC in ["fp16", "fp32", "amp"]
 
@@ -478,49 +496,38 @@ class BiomedAP_PubMedCLIP(TrainerX):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
 
-        # 下载模型文件（如果不存在）
-        for filename, url in files.items():
-            filepath = os.path.join(directory, filename)
-            if not os.path.exists(filepath):
-                print(f"{filename} not found in {directory}. Downloading...")
-                download_file(url, filepath)
-            else:
-                print(f"{filename} already exists in {directory}.")
-
-        print(f"Loading PubMedCLIP (backbone: ViT-B/32)")
-        clip_model = load_clip_to_cpu(cfg)
-
+        print(f"Loading PubMedCLIP")
+        vision_model, text_model, text_projection, tokenizer = load_pubmedclip_to_cpu(cfg)
+        
         if cfg.TRAINER.BIOMEDAP.PREC == "fp32" or cfg.TRAINER.BIOMEDAP.PREC == "amp":
-            clip_model.float()
+            vision_model.float()
+            text_model.float()
+            text_projection.float()
 
-        print("Building custom CLIP with Text-Guided Visual Prompts")
-        self.model = CustomCLIP(cfg, classnames, clip_model.eval())
+        print("Building custom CLIP with Cross-Modal Fusion")
+        self.model = CustomCLIP(cfg, classnames, vision_model.eval(), text_model.eval(), text_projection, tokenizer)
 
         print("Turning off gradients in both the image and the text encoder")
-        # 【关键】只优化文本prompt和text-guided模块
-        names_to_update = [
-            "prompt_learner.ctx",              # 文本prompt
-            "text_guided_prompt"                # Text-guided模块（全部参数）
-        ]
-
+        
+        # ========== 添加fusion_modules到可训练参数 ==========
+        names_to_update = ["prompt_learner.ctx"]
+        
+        if hasattr(cfg.TRAINER.BIOMEDAP, 'ENABLE_FUSION') and cfg.TRAINER.BIOMEDAP.ENABLE_FUSION:
+            for name, param in self.model.named_parameters():
+                if "fusion_modules" in name:
+                    names_to_update.append(name)
+                    param.requires_grad_(True)
+        
         for name, param in self.model.named_parameters():
-            param.requires_grad_(False)  # 先全部冻结
-            for update_name in names_to_update:
-                if update_name in name:
-                    param.requires_grad_(True)  # 解冻需要更新的
-                    break
-
-        # 检查可训练参数
+            if not any(update_name in name for update_name in names_to_update):
+                param.requires_grad_(False)
+        
         enabled = set()
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 enabled.add(name)
         print(f"Parameters to be updated: {sorted(enabled)}")
-        print(f"Total trainable parameters: {len(enabled)}")
-        
-        # 计算参数量
-        total_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        print(f"Total trainable parameter count: {total_params:,}")
+        print(f"Parameters count: {len(enabled)}")
         
         if cfg.MODEL.INIT_WEIGHTS:
             load_pretrained_weights(self.model, cfg.MODEL.INIT_WEIGHTS)
@@ -600,12 +607,13 @@ class BiomedAP_PubMedCLIP(TrainerX):
             state_dict = checkpoint["state_dict"]
             epoch = checkpoint["epoch"]
 
-            # 忽略固定的 token 向量
             if "prompt_learner.token_prefix" in state_dict:
                 del state_dict["prompt_learner.token_prefix"]
 
             if "prompt_learner.token_suffix" in state_dict:
                 del state_dict["prompt_learner.token_suffix"]
 
-            print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
+            print("Loading weights to {} from {} (epoch = {})".format(name, model_path, epoch))
             self._models[name].load_state_dict(state_dict, strict=False)
+
+            
